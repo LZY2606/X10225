@@ -1,0 +1,225 @@
+[
+    {
+        "name": "duplicate values are matched without overcounting moves",
+        "before": [
+            "x",
+            "x",
+            "a",
+            "b"
+        ],
+        "after": [
+            "b",
+            "a",
+            "x",
+            "x"
+        ],
+        "patch": [
+            {
+                "op": "add",
+                "path": "/0",
+                "value": "b"
+            },
+            {
+                "op": "add",
+                "path": "/1",
+                "value": "a"
+            },
+            {
+                "op": "remove",
+                "path": "/4"
+            },
+            {
+                "op": "remove",
+                "path": "/4"
+            }
+        ]
+    },
+    {
+        "name": "deep objects crossing positions produce a single move",
+        "before": [
+            {
+                "k": {
+                    "a": [
+                        1,
+                        2
+                    ]
+                }
+            },
+            {
+                "k": {
+                    "a": [
+                        3,
+                        4
+                    ]
+                }
+            }
+        ],
+        "after": [
+            {
+                "k": {
+                    "a": [
+                        3,
+                        4
+                    ]
+                }
+            },
+            {
+                "k": {
+                    "a": [
+                        1,
+                        2
+                    ]
+                }
+            }
+        ],
+        "patch": [
+            {
+                "op": "move",
+                "from": "/0",
+                "path": "/1"
+            }
+        ]
+    },
+    {
+        "name": "head insertion stays a single leading add",
+        "before": [
+            1,
+            2,
+            3
+        ],
+        "after": [
+            0,
+            1,
+            2,
+            3
+        ],
+        "patch": [
+            {
+                "op": "add",
+                "path": "/0",
+                "value": 0
+            }
+        ]
+    },
+    {
+        "name": "tail insertion stays a single trailing add",
+        "before": [
+            1,
+            2,
+            3
+        ],
+        "after": [
+            1,
+            2,
+            3,
+            4
+        ],
+        "patch": [
+            {
+                "op": "add",
+                "path": "/3",
+                "value": 4
+            }
+        ]
+    },
+    {
+        "name": "cross moves collapse into ordered moves",
+        "before": [
+            1,
+            2,
+            3,
+            4
+        ],
+        "after": [
+            4,
+            3,
+            2,
+            1
+        ],
+        "patch": [
+            {
+                "op": "move",
+                "from": "/0",
+                "path": "/3"
+            },
+            {
+                "op": "move",
+                "from": "/0",
+                "path": "/2"
+            },
+            {
+                "op": "move",
+                "from": "/0",
+                "path": "/1"
+            }
+        ]
+    },
+    {
+        "name": "duplicate head and tail values do not pair across unequal elements",
+        "before": [
+            "x",
+            "x",
+            "a"
+        ],
+        "after": [
+            "a",
+            "x",
+            "x",
+            "b"
+        ],
+        "patch": [
+            {
+                "op": "add",
+                "path": "/0",
+                "value": "a"
+            },
+            {
+                "op": "replace",
+                "path": "/3",
+                "value": "b"
+            }
+        ]
+    },
+    {
+        "name": "nested duplicate array swap",
+        "before": [
+            {
+                "tags": [
+                    "n",
+                    "n",
+                    1
+                ]
+            },
+            {
+                "tags": [
+                    "n",
+                    "n",
+                    2
+                ]
+            }
+        ],
+        "after": [
+            {
+                "tags": [
+                    "n",
+                    "n",
+                    1
+                ]
+            },
+            {
+                "tags": [
+                    "n",
+                    "n",
+                    1
+                ]
+            }
+        ],
+        "patch": [
+            {
+                "op": "replace",
+                "path": "/1/tags/2",
+                "value": 1
+            }
+        ]
+    }
+]

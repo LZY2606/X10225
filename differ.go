@@ -1,6 +1,7 @@
 package jsondiff
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"unsafe"
@@ -16,8 +17,16 @@ type Differ struct {
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	match            *arrayMatcher
 	isCompact        bool
 	compactInPlace   bool
+
+	// Diagnostic-only seams. They are unexported and used
+	// exclusively by in-package tests to simulate a hash
+	// collision and an injectable mid-comparison failure.
+	// Production callers can neither set nor observe them.
+	digestSpoof map[uint64]uint64
+	matchFault  func(phase matchPhase)
 }
 
 type (
@@ -72,8 +81,24 @@ func (d *Differ) Patch() Patch {
 
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
+//
+// Each invocation starts from a clean, call-scoped state:
+// the pointer builder and the diagnostic array matcher are
+// rebuilt, while factorization data is prepared fresh. If
+// the comparison fails midway (for instance when an input
+// holds a value of an unsupported JSON type), the patch and
+// the factorization index are restored to their state on
+// entry, so a subsequent retry with identical inputs is
+// not affected by half-written state.
 func (d *Differ) Compare(src, tgt interface{}) {
+	savedPatch := d.patch[:len(d.patch):len(d.patch)]
+	savedHashmap := d.hashmap
+	savedSnapshot := d.snapshotPatchLen
+
+	d.ptr.reset()
+	d.match = newArrayMatcher(d)
 	if d.opts.factorize {
+		d.hashmap = make(map[uint64]jsonNode)
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
 	}
@@ -86,7 +111,45 @@ func (d *Differ) Compare(src, tgt interface{}) {
 			}
 		}
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Roll back every shared accumulator the
+			// comparison may have mutated, then re-panic so
+			// that the public error model is preserved.
+			d.patch = savedPatch
+			d.hashmap = savedHashmap
+			d.snapshotPatchLen = savedSnapshot
+			d.ptr.reset()
+			panic(r)
+		}
+	}()
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+}
+
+// digest is the single hashing entry point shared by
+// preparation, unordered equivalence and move/copy
+// candidate discovery. A digest only pre-filters
+// candidates: every digest-based match is still confirmed
+// through deepEqual before it can influence a patch.
+func (d *Differ) digest(v interface{}, sort bool) uint64 {
+	h := d.hasher.digest(v, sort)
+	if d.digestSpoof != nil {
+		if spoofed, ok := d.digestSpoof[h]; ok {
+			return spoofed
+		}
+	}
+	return h
+}
+
+// matchCounters returns the diagnostic counters of the
+// last comparison. It is intentionally unexported: the
+// counters are observability-only and never affect results.
+func (d *Differ) matchCounters() MatchCounters {
+	if d.match == nil {
+		return MatchCounters{}
+	}
+	return d.match.counters
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -159,7 +222,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -335,55 +398,79 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
-	d.snapshotPatchLen = len(d.patch)
+	pairs := d.match.lcs(src, tgt)
+	regionPrefix := ptr.copy()
 
-	var ai, bi int // src && tgt arrows
+	// Generate the move/copy factored region under an
+	// isolated candidate scope, so a rejected attempt can be
+	// retried conservatively without touching candidates
+	// emitted by enclosing arrays or by sibling values.
+	d.match.beginRegion(regionPrefix)
+	regionStart := len(d.patch)
+	d.snapshotPatchLen = regionStart
+
+	d.generateLCSWalk(ptr, src, tgt, doc, pairs)
+
+	region := d.patch[regionStart:]
+	if arrayRegionValid(regionPrefix, src, tgt, region) {
+		d.match.commitRegion()
+		return
+	}
+	// The factored region cannot be proven applicable:
+	// duplicated values or interleaved moves may pair
+	// ambiguously. Roll it back and regenerate the array
+	// with the conservative positional algorithm, which is
+	// always applicable, rather than guessing a move.
+	d.patch = d.patch[:regionStart]
+	d.match.rollbackRegion()
+
+	d.match.beginRegion(regionPrefix)
+	d.match.currentRegion().conservative = true
+	d.generatePositionalArray(ptr, src, tgt, doc)
+	conservative := d.patch[regionStart:]
+	if !arrayRegionValid(regionPrefix, src, tgt, conservative) {
+		panic(fmt.Errorf("jsondiff: conservative array diff failed to apply at %q", regionPrefix))
+	}
+	d.match.commitRegion()
+}
+
+// generateLCSWalk emits the LCS-driven add/remove/replace
+// operations for one array and lets factorization convert
+// removal/addition pairs into moves through the matcher.
+func (d *Differ) generateLCSWalk(ptr pointer, src, tgt []interface{}, doc string, pairs [][2]int) {
+	var ai, bi int
 	var adds, removes int
 
 	adjust := func(i int) int {
-		// Adjust index considering add and remove
-		// operations that precede it.
 		return i + adds - removes
 	}
+	emitDiff := func() {
+		ptr.appendIndex(adjust(ai))
+		if d.opts.rationalize {
+			d.diff(ptr, src[ai], tgt[bi], findIndex(doc, ptr.base.idx))
+		} else {
+			d.diff(ptr, src[ai], tgt[bi], doc)
+		}
+		ptr.rewind()
+	}
 
-	// Iterate over all the indexs of the LCS, which
-	// represent the position of items that are present
-	// in both the source and target slices.
 	for p := 0; p < len(pairs); p++ {
 		ma, mb := pairs[p][0], pairs[p][1]
-
-		// Proceed with addition/deletion or change events
-		// until both arrows reach the current index.
 		for ai < ma || bi < mb {
 			switch {
 			case ai < ma && bi < mb:
-				// Both arrows points to an item before the
-				// current match index, which indicate an
-				// equal amount of different items.
-				ptr.appendIndex(adjust(ai))
-				if d.opts.rationalize {
-					d.diff(ptr, src[ai], tgt[bi], findIndex(doc, ptr.base.idx))
-				} else {
-					d.diff(ptr, src[ai], tgt[bi], doc)
-				}
-				ptr.rewind()
+				emitDiff()
 				ai++
 				bi++
 			case ai < ma:
-				// The left arrow representing the source slice
-				// is lower than the current match index, which
-				// indicate that a preceding item has been removed.
 				ptr.appendIndex(adjust(ai))
-
 				if !d.isIgnored(ptr) {
 					d.remove(ptr.copy(), src[ai])
 				}
 				ptr.rewind()
 				ai++
 				removes++
-			default: // bi < mb
-				// Opposite case of the previous condition.
+			default:
 				ptr.appendIndex(bi)
 				if !d.isIgnored(ptr) {
 					d.add(ptr.copy(), tgt[bi], doc, true)
@@ -393,38 +480,24 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				adds++
 			}
 		}
-		// Both arrows reached the current match index
-		// where the elements of the source and target
-		// slice are equal, i.e. `src[ai] == tgt[bi]`.
 		ai++
 		bi++
 	}
-	// After all index pairs of the LCS have been traversed,
-	// the remaining items up to the length of the source and
-	// target slices are iterated. The same logic applies to
-	// detect addition/deletion or change events.
 	for ai < len(src) || bi < len(tgt) {
 		switch {
 		case ai < len(src) && bi < len(tgt):
-			ptr.appendIndex(adjust(ai))
-			if d.opts.rationalize {
-				d.diff(ptr, src[ai], tgt[bi], findIndex(doc, ptr.base.idx))
-			} else {
-				d.diff(ptr, src[ai], tgt[bi], doc)
-			}
-			ptr.rewind()
+			emitDiff()
 			ai++
 			bi++
 		case ai < len(src):
 			ptr.appendIndex(adjust(ai))
-
 			if !d.isIgnored(ptr) {
 				d.remove(ptr.copy(), src[ai])
 			}
 			ptr.rewind()
 			ai++
 			removes++
-		default: // bi < len(tgt)
+		default:
 			ptr.appendIndex(bi)
 			if !d.isIgnored(ptr) {
 				d.add(ptr.copy(), tgt[bi], doc, true)
@@ -436,28 +509,54 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 	}
 }
 
-func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
+// generatePositionalArray emits the non-LCS, slot-by-slot
+// comparison for one array: common indices are diffed,
+// surplus source elements are removed and extra target
+// elements are appended. Factorization remains available
+// across array boundaries (whole-object moves and copies of
+// unchanged values), while same-array moves are suppressed
+// by the conservative region scope.
+func (d *Differ) generatePositionalArray(ptr pointer, src, tgt []interface{}, doc string) {
+	sl, tl := len(src), len(tgt)
+	ml := min(sl, tl)
 
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
+	ptr.snapshot()
+	for i := 0; i < ml; i++ {
+		ptr.appendIndex(i)
+		if d.opts.rationalize {
+			d.diff(ptr, src[i], tgt[i], findIndex(doc, ptr.base.idx))
+		} else {
+			d.diff(ptr, src[i], tgt[i], doc)
 		}
-		count--
+		ptr.rewind()
 	}
-	return count == 0
+	for i := ml; i < sl; i++ {
+		ptr.appendIndex(i)
+		if !d.isIgnored(ptr) {
+			d.remove(ptr.copy(), src[i])
+		}
+		ptr.rewind()
+	}
+	if tl > sl {
+		np := ptr.clone()
+		np.appendKey("-")
+		ap := np.copy()
+		for i := ml; i < tl; i++ {
+			ptr.appendIndex(i)
+			if !d.isIgnored(ptr) {
+				d.add(ap, tgt[i], doc, false)
+			}
+			ptr.rewind()
+		}
+	}
+}
+
+func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
+	if d.match == nil {
+		// Standalone use outside of a top-level comparison.
+		d.match = newArrayMatcher(d)
+	}
+	return d.match.unorderedEqual(src, tgt)
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -474,27 +573,29 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
-	if idx != -1 {
+	idx := d.match.findRemoved(d, path, v)
+	switch idx {
+	case -1:
+		// No reusable removed value; fall back to a copy of
+		// an unchanged value, or a plain addition.
+	case -2:
+		// The only matching candidate cannot be moved into
+		// its own child path.
+		return
+	default:
 		op := d.patch[idx]
-
-		// https://tools.ietf.org/html/rfc6902#section-4.4f
-		// The "from" location MUST NOT be a proper prefix
-		// of the "path" location; i.e., a location cannot
-		// be moved into one of its children.
-		if !hasProperPathPrefix(op.Path, path) {
-			d.patch = d.patch.remove(idx)
-			if !lcs {
-				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
-			} else {
-				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
-			}
+		d.patch = d.patch.remove(idx)
+		if !lcs {
+			d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
+		} else {
+			d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
 		}
 		return
 	}
 	uptr := d.findUnchanged(v)
 
-	if len(uptr) != 0 && !d.opts.invertible {
+	if len(uptr) != 0 && !d.opts.invertible &&
+		d.match.copySourceAllowed(uptr, path) {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
 	} else {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, len(doc))
@@ -506,27 +607,26 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Register the move candidate exactly once, when
+		// the removal is emitted, so later additions probe a
+		// precomputed, digest-indexed candidate set.
+		d.match.registerRemoved(path, v)
+	}
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		k := d.digest(v, false)
 		node, ok := d.hashmap[k]
-		if ok {
+		if ok && deepEqual(node.val, v) {
+			// Confirm the digest hit structurally; two
+			// distinct values sharing a digest must not be
+			// treated as copy sources of each other.
 			return node.ptr
 		}
 	}
 	return emptyPointer
-}
-
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
-		}
-	}
-	return -1
 }
 
 func hasProperPathPrefix(prefix, path string) bool {
