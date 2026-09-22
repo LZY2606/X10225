@@ -35,6 +35,10 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// eqID identifies OldValue/Value within a single Compare
+	// invocation. It is used solely to memoize equality during
+	// move/copy candidate discovery and is never serialized.
+	eqID uint32 `json:"-"`
 }
 
 // MarshalJSON implements the json.Marshaler interface.
@@ -104,7 +108,11 @@ func (p *Patch) remove(idx int) Patch {
 	return (*p)[:idx+copy((*p)[idx:], (*p)[idx+1:])]
 }
 
-func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl int) Patch {
+func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl int, ids ...uint32) Patch {
+	var id uint32
+	if len(ids) != 0 {
+		id = ids[0]
+	}
 	return append(*p, Operation{
 		Type:     typ,
 		From:     from,
@@ -112,12 +120,13 @@ func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl i
 		OldValue: src,
 		Value:    tgt,
 		valueLen: vl,
+		eqID:     id,
 	})
 }
 
-func (p *Patch) insert(pos int, typ string, from, path string, src, tgt interface{}, vl int) Patch {
+func (p *Patch) insert(pos int, typ string, from, path string, src, tgt interface{}, vl int, id uint32) Patch {
 	if pos > len(*p) {
-		return p.append(typ, from, path, src, tgt, vl)
+		return p.append(typ, from, path, src, tgt, vl, id)
 	}
 	op := Operation{
 		Type:     typ,
@@ -126,6 +135,7 @@ func (p *Patch) insert(pos int, typ string, from, path string, src, tgt interfac
 		OldValue: src,
 		Value:    tgt,
 		valueLen: vl,
+		eqID:     id,
 	}
 	return append((*p)[:pos], append([]Operation{op}, (*p)[pos:]...)...)
 }

@@ -156,7 +156,7 @@ func TestPatch_jsonLength(t *testing.T) {
 
 func Test_issue26(_ *testing.T) {
 	p := new(Patch)
-	p.insert(6, OperationAdd, emptyPointer, "/a", nil, 42, 0)
+	p.insert(6, OperationAdd, emptyPointer, "/a", nil, 42, 0, 0)
 }
 
 func typeNilIface() interface{} {

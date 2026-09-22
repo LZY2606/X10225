@@ -8,10 +8,14 @@ import (
 )
 
 type hasher struct {
-	mh maphash.Hash
+	mh         maphash.Hash
+	digestFunc func(val interface{}, sort bool) uint64
 }
 
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
+	if h.digestFunc != nil {
+		return h.digestFunc(val, sort)
+	}
 	h.mh.Reset()
 	h.hash(val, sort)
 

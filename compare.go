@@ -34,8 +34,11 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
-			e := r.(invalidJSONTypeError)
-			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+			if e, ok := r.(invalidJSONTypeError); ok {
+				err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+			} else {
+				err = fmt.Errorf("jsondiff: comparison aborted: %v", r)
+			}
 			patch = nil
 		}
 	}()
