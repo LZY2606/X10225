@@ -5,6 +5,17 @@ package jsondiff
 // is, the indices into the source and target slices
 // where the LCS items are located
 func lcs(src, tgt []interface{}) [][2]int {
+	return lcsMatch(src, tgt, func(i, j int) bool {
+		return deepEqual(src[i], tgt[j])
+	})
+}
+
+// lcsMatch is the generic version of lcs. It uses the
+// given equality function to compare the elements of the
+// source and target slices by their indices, which allows
+// the caller to compute the equality relation only once,
+// and to account for the comparisons performed.
+func lcsMatch(src, tgt []interface{}, eq func(i, j int) bool) [][2]int {
 	t := make([][]int, len(src)+1)
 
 	for i := 0; i <= len(src); i++ {
@@ -12,7 +23,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 	}
 	for i := 1; i < len(t); i++ {
 		for j := 1; j < len(t[i]); j++ {
-			if deepEqual(src[i-1], tgt[j-1]) {
+			if eq(i-1, j-1) {
 				t[i][j] = t[i-1][j-1] + 1
 			} else {
 				t[i][j] = max(t[i-1][j], t[i][j-1])
@@ -24,7 +35,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 
 	for i > 0 && j > 0 {
 		switch {
-		case deepEqual(src[i-1], tgt[j-1]):
+		case eq(i-1, j-1):
 			s = append(s, [2]int{i - 1, j - 1})
 			i--
 			j--
