@@ -16,8 +16,22 @@ type Differ struct {
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	digestFn         func(interface{}, bool) uint64
+	stats            *Stats
+	removed          []removeCandidate
+	removedByHash    map[uint64][]int
 	isCompact        bool
 	compactInPlace   bool
+}
+
+// A removeCandidate tracks a remove operation of the patch
+// being generated, so that move candidates can be looked up
+// by the hash of their value instead of scanning the whole
+// patch with deep comparisons.
+type removeCandidate struct {
+	hash     uint64
+	patchIdx int
+	consumed bool
 }
 
 type (
@@ -47,11 +61,46 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.removed = d.removed[:0]
+
+	if d.stats != nil {
+		*d.stats = Stats{}
+	}
+	for k := range d.removedByHash {
+		delete(d.removedByHash, k)
+	}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
 		delete(d.hashmap, k)
 	}
+}
+
+// digest returns the hash of the given value. It is the
+// single entry point used by the array matching and the
+// move/copy candidate discovery to hash candidate values,
+// and it accounts the computation in the diagnostic stats.
+func (d *Differ) digest(v interface{}, sort bool) uint64 {
+	if d.stats != nil {
+		d.stats.HashDigests++
+	}
+	// digestFn is a test hook that replaces the default
+	// hasher to simulate hash collisions; the values it
+	// produces flow through the exact same production
+	// matching path as real digests.
+	if d.digestFn != nil {
+		return d.digestFn(v, sort)
+	}
+	return d.hasher.digest(v, sort)
+}
+
+// deepEqual reports whether src and tgt are deeply equal,
+// and accounts the comparison in the diagnostic stats.
+func (d *Differ) deepEqual(src, tgt interface{}) bool {
+	if d.stats != nil {
+		d.stats.DeepEqualComparisons++
+	}
+	return deepEqual(src, tgt)
 }
 
 // WithOpts applies the given options to the Differ
@@ -159,7 +208,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -215,6 +264,7 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
 		d.patch = d.patch[:lastOpIdx]
+		d.truncateRemoved(lastOpIdx)
 
 		// Allocate a new string for the operation's path.
 		replaceOp.Path = ptr.copy()
@@ -335,7 +385,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := newPairMatcher(d, src, tgt).lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -440,24 +490,40 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
+	// Bucket the source elements by their hash. Each target
+	// element is then matched against a single, not yet
+	// consumed, element of its own bucket, so that duplicate
+	// values are accounted for as a multiset, and values that
+	// merely collide on their hash are never paired together.
+	buckets := make(map[uint64][]int, len(src))
 
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+	for i := range src {
+		k := d.digest(src[i], d.opts.equivalent)
+		buckets[k] = append(buckets[k], i)
 	}
+	consumed := make([]bool, len(src))
+
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
+		k := d.digest(v, d.opts.equivalent)
+		matched := false
+		for _, i := range buckets[k] {
+			if consumed[i] {
+				continue
+			}
+			// Values whose type is not a valid JSON type
+			// cannot be deep-compared; they can only be
+			// matched by their hash.
+			if jsonTypeSwitch(src[i]) == jsonInvalid || d.deepEqual(src[i], v) {
+				consumed[i] = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return false
 		}
-		count--
 	}
-	return count == 0
+	return true
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -484,9 +550,11 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
 			d.patch = d.patch.remove(idx)
+			d.consumeRemoved(idx)
 			if !lcs {
 				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
 			} else {
+				d.shiftRemoved(d.snapshotPatchLen)
 				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
 			}
 		}
@@ -506,13 +574,80 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	d.registerRemove(len(d.patch)-1, v)
+}
+
+// registerRemove indexes the remove operation at the given
+// patch index as a move candidate, by the hash of its old
+// value, so that subsequent add operations can be matched
+// against it without scanning the whole patch.
+func (d *Differ) registerRemove(patchIdx int, v interface{}) {
+	if !d.opts.factorize {
+		return
+	}
+	h := d.digest(v, false)
+	if d.removedByHash == nil {
+		d.removedByHash = make(map[uint64][]int)
+	}
+	id := len(d.removed)
+	d.removed = append(d.removed, removeCandidate{
+		hash:     h,
+		patchIdx: patchIdx,
+	})
+	d.removedByHash[h] = append(d.removedByHash[h], id)
+}
+
+// consumeRemoved marks the remove candidate at the given
+// patch index as consumed, and adjusts the position of the
+// remaining candidates to account for the removal of the
+// operation at that index.
+func (d *Differ) consumeRemoved(idx int) {
+	for i := range d.removed {
+		c := &d.removed[i]
+		if c.consumed {
+			continue
+		}
+		switch {
+		case c.patchIdx == idx:
+			c.consumed = true
+		case c.patchIdx > idx:
+			c.patchIdx--
+		}
+	}
+}
+
+// shiftRemoved adjusts the position of the remove candidates
+// to account for the insertion of an operation at the given
+// patch index.
+func (d *Differ) shiftRemoved(pos int) {
+	for i := range d.removed {
+		c := &d.removed[i]
+		if !c.consumed && c.patchIdx >= pos {
+			c.patchIdx++
+		}
+	}
+}
+
+// truncateRemoved discards the remove candidates located at
+// or beyond the given patch index, after the patch has been
+// truncated by the rationalization of its operations.
+func (d *Differ) truncateRemoved(idx int) {
+	for i := range d.removed {
+		if d.removed[i].patchIdx >= idx {
+			d.removed[i].consumed = true
+		}
+	}
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		k := d.digest(v, false)
 		node, ok := d.hashmap[k]
-		if ok {
+		// The hash map is indexed by the digest of the
+		// values; confirm a hit with a deep comparison
+		// so that colliding values are not mistaken for
+		// copy candidates.
+		if ok && d.deepEqual(node.val, v) {
 			return node.ptr
 		}
 	}
@@ -520,10 +655,19 @@ func (d *Differ) findUnchanged(v interface{}) string {
 }
 
 func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+	h := d.digest(v, false)
+	// The candidates are indexed by the hash of their old
+	// value, in patch order; only the values that collide
+	// with the hash of v are deep-compared, which preserves
+	// the first-match semantics of a full patch scan while
+	// evaluating each candidate at most once per hash.
+	for _, id := range d.removedByHash[h] {
+		c := &d.removed[id]
+		if c.consumed {
+			continue
+		}
+		if d.deepEqual(d.patch[c.patchIdx].OldValue, v) {
+			return c.patchIdx
 		}
 	}
 	return -1

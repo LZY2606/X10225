@@ -5,6 +5,16 @@ package jsondiff
 // is, the indices into the source and target slices
 // where the LCS items are located
 func lcs(src, tgt []interface{}) [][2]int {
+	return newPairMatcher(&Differ{}, src, tgt).lcsPairs()
+}
+
+// lcsPairs computes the index pairs of the longest common
+// subsequence of the slices held by the matcher. The equality
+// of each candidate pair is evaluated at most once, during
+// the fill of the dynamic programming table; the backtrack
+// phase reuses the cached results.
+func (m *pairMatcher) lcsPairs() [][2]int {
+	src, tgt := m.src, m.tgt
 	t := make([][]int, len(src)+1)
 
 	for i := 0; i <= len(src); i++ {
@@ -12,7 +22,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 	}
 	for i := 1; i < len(t); i++ {
 		for j := 1; j < len(t[i]); j++ {
-			if deepEqual(src[i-1], tgt[j-1]) {
+			if m.equal(i-1, j-1) {
 				t[i][j] = t[i-1][j-1] + 1
 			} else {
 				t[i][j] = max(t[i-1][j], t[i][j-1])
@@ -24,7 +34,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 
 	for i > 0 && j > 0 {
 		switch {
-		case deepEqual(src[i-1], tgt[j-1]):
+		case m.equal(i-1, j-1):
 			s = append(s, [2]int{i - 1, j - 1})
 			i--
 			j--
