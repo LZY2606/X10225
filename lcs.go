@@ -3,39 +3,32 @@ package jsondiff
 // lcs computes the longest common subsequence of two
 // slices and returns the index pairs of the LCS, that
 // is, the indices into the source and target slices
-// where the LCS items are located
+// where the LCS items are located.
+//
+// It delegates to the same arrayMatcher used by the
+// production diff path: there is no second algorithm
+// maintained in parallel.
 func lcs(src, tgt []interface{}) [][2]int {
-	t := make([][]int, len(src)+1)
+	pairs, _ := lcsPairs(src, tgt, nil)
+	return pairs
+}
 
-	for i := 0; i <= len(src); i++ {
-		t[i] = make([]int, len(tgt)+1)
+// lcsPairs is the shared entry used by lcs and by legacy
+// fallbacks. A non-nil stats argument collects diagnostics.
+func lcsPairs(src, tgt []interface{}, stats *arrayDiffStats) ([][2]int, error) {
+	var local arrayDiffStats
+	if stats == nil {
+		stats = &local
 	}
-	for i := 1; i < len(t); i++ {
-		for j := 1; j < len(t[i]); j++ {
-			if deepEqual(src[i-1], tgt[j-1]) {
-				t[i][j] = t[i-1][j-1] + 1
-			} else {
-				t[i][j] = max(t[i-1][j], t[i][j-1])
-			}
-		}
-	}
-	i, j := len(src), len(tgt)
-	s := make([][2]int, 0, t[i][j])
+	h := hasher{}
+	m := newArrayMatcher(src, tgt, h.digest, stats)
+	return m.lcs()
+}
 
-	for i > 0 && j > 0 {
-		switch {
-		case deepEqual(src[i-1], tgt[j-1]):
-			s = append(s, [2]int{i - 1, j - 1})
-			i--
-			j--
-		case t[i-1][j] > t[i][j-1]:
-			i--
-		default:
-			j--
-		}
-	}
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
-	return s
+// lcsLegacy is the fallback LCS computation used when the
+// unified matcher of a comparison declines an input. It
+// shares the exact same implementation.
+func lcsLegacy(src, tgt []interface{}, stats *arrayDiffStats) [][2]int {
+	pairs, _ := lcsPairs(src, tgt, stats)
+	return pairs
 }
