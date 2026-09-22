@@ -203,13 +203,22 @@ func TestDiffer_unorderedDeepEqualSlice(t *testing.T) {
 		equal    bool
 	}{
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{3, 2, 1},
+			// Numbers are float64, the type produced by the
+			// public Compare/CompareJSON entry points.
+			src:   []interface{}{1.0, 2.0, 3.0},
+			tgt:   []interface{}{3.0, 2.0, 1.0},
 			equal: true,
 		},
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{4, 3, 2, 1},
+			src:   []interface{}{1.0, 2.0, 3.0},
+			tgt:   []interface{}{4.0, 3.0, 2.0, 1.0},
+			equal: false,
+		},
+		{
+			// Duplicate values use multiset semantics: a value
+			// appearing twice must match two occurrences.
+			src:   []interface{}{1.0, 1.0, 2.0},
+			tgt:   []interface{}{1.0, 2.0, 2.0},
 			equal: false,
 		},
 		{

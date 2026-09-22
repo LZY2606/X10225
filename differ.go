@@ -9,7 +9,13 @@ import (
 // A Differ generates JSON Patch (RFC 6902).
 // The zero value is an empty generator ready to use.
 type Differ struct {
+	// hashmap is retained for storage reuse across comparisons;
+	// candidate lookup is owned by the per-comparison matcher.
 	hashmap          map[uint64]jsonNode
+	matcher          *arrayMatcher
+	stats            compareStats
+	fault            faultHook
+	digestOverride   func(any, bool) uint64
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
@@ -18,6 +24,28 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+}
+
+// faultHook is a test-only seam. When it returns a non-nil
+// error at a fault point, the comparison is aborted, rolled
+// back and the error surfaced. Production code leaves it nil.
+type faultHook func(stage string) error
+
+// Fault points recognized by the fault hook.
+const (
+	faultPointAfterPrepare = "after_prepare"
+	faultPointArrayMatched = "array_matched"
+)
+
+// errComparisonAborted wraps a failure injected through the
+// fault hook. It is recoverable: retrying the exact same
+// comparison yields the normal result.
+type errComparisonAborted struct {
+	stage string
+}
+
+func (e *errComparisonAborted) Error() string {
+	return "jsondiff: comparison aborted at stage " + e.stage
 }
 
 type (
@@ -52,6 +80,35 @@ func (d *Differ) Reset() {
 	for k := range d.hashmap {
 		delete(d.hashmap, k)
 	}
+	// Drop all per-comparison diagnostic and candidate state.
+	d.matcher = nil
+	d.stats = compareStats{}
+}
+
+// diagnosticStats returns a snapshot of the counters collected
+// during the most recent comparison. It is diagnostic only and
+// is part of the unexported test surface.
+func (d *Differ) diagnosticStats() Stats {
+	return d.stats.snapshot()
+}
+
+// withFault installs a one-shot or persistent fault hook used
+// by the internal behavior-guard tests. Production code paths
+// never install a hook.
+func (d *Differ) withFault(h faultHook) *Differ {
+	d.fault = h
+	return d
+}
+
+// failAt aborts the current comparison when a fault hook is
+// installed and reports a non-nil error for the given stage.
+func (d *Differ) failAt(stage string) {
+	if d.fault == nil {
+		return
+	}
+	if err := d.fault(stage); err != nil {
+		panic(err)
+	}
 }
 
 // WithOpts applies the given options to the Differ
@@ -73,9 +130,34 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	_ = d.compareInternal(src, tgt)
+}
+
+// compareInternal runs a single comparison inside an isolated
+// session: matcher, candidate index and diagnostic counters are
+// created per run and never leak into another comparison. A
+// failure raised through the fault hook is recovered by rolling
+// the Differ back to its state before the run.
+func (d *Differ) compareInternal(src, tgt interface{}) (err error) {
+	savedPatch := d.patch
+	patchStart := len(d.patch)
+	d.beginComparison()
+
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(*errComparisonAborted); ok {
+				d.rollbackComparison(savedPatch, patchStart)
+				err = e
+				return
+			}
+			panic(r)
+		}
+	}()
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
+		d.failAt(faultPointAfterPrepare)
 	}
 	if d.opts.rationalize {
 		if !d.isCompact {
@@ -87,6 +169,24 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+	return nil
+}
+
+// beginComparison opens a fresh, isolated comparison session.
+func (d *Differ) beginComparison() {
+	d.matcher = newArrayMatcher(d)
+	d.stats = compareStats{}
+}
+
+// rollbackComparison restores the state observed before the run
+// that failed: the public patch is truncated to its previous
+// length, per-run candidate/counter state is dropped, and the
+// pointer buffer is rewound so a retry starts from a clean slate.
+func (d *Differ) rollbackComparison(saved Patch, start int) {
+	d.patch = saved[:start]
+	d.ptr.reset()
+	d.matcher = nil
+	d.stats = compareStats{}
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -159,14 +259,10 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
-		d.hashmap[k] = jsonNode{
-			ptr: ptr.copy(),
-			val: tgt,
-		}
+		d.matcher.rememberUnchanged(ptr.copy(), tgt)
 		return
 	}
 	// At this point, the source and target values
@@ -185,12 +281,19 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		oobj := vsrc
 		nobj := tgt.(map[string]interface{})
 
-		for k, v1 := range oobj {
-			if v2, ok := nobj[k]; ok {
-				p := ptr.clone()
-				p.appendKey(k)
-				d.prepare(p, v1, v2)
+		// Iterate shared keys in deterministic order so that
+		// unchanged locations are always recorded identically.
+		keys := make([]string, 0, min(len(oobj), len(nobj)))
+		for k := range oobj {
+			if _, ok := nobj[k]; ok {
+				keys = append(keys, k)
 			}
+		}
+		sortStrings(keys)
+		for _, k := range keys {
+			p := ptr.clone()
+			p.appendKey(k)
+			d.prepare(p, oobj[k], nobj[k])
 		}
 	default:
 		// Skipped.
@@ -214,6 +317,10 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// operations that represents the changes between
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
+		// Remove operations consumed by the collapsing replace
+		// are no longer live move sources; their patch indices
+		// would be stale after the rewrite.
+		d.matcher.invalidateCandidatesAfter(lastOpIdx)
 		d.patch = d.patch[:lastOpIdx]
 
 		// Allocate a new string for the operation's path.
@@ -296,7 +403,7 @@ func (d *Differ) compareArrays(ptr pointer, src, tgt []interface{}, doc string) 
 		}
 		goto comparisons // skip equivalence test since arrays are different
 	}
-	if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
+	if d.opts.equivalent && d.matcher.multisetEqual(src, tgt, true) {
 		return
 	}
 comparisons:
@@ -330,12 +437,15 @@ comparisons:
 
 func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc string) {
 	if len(src) == len(tgt) {
-		if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
+		if d.opts.equivalent && d.matcher.multisetEqual(src, tgt, true) {
 			return
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.matcher.lcsPairs(src, tgt)
+	// Recoverable mid-run fault point: matching has produced its
+	// candidates, but no patch operation has been emitted yet.
+	d.failAt(faultPointArrayMatched)
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -436,30 +546,6 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 	}
 }
 
-func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
-}
-
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
 	vl := len(doc)
 
@@ -474,7 +560,7 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	idx := d.matcher.findRemoveCandidate(v)
 	if idx != -1 {
 		op := d.patch[idx]
 
@@ -483,16 +569,24 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// of the "path" location; i.e., a location cannot
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
-			d.patch = d.patch.remove(idx)
-			if !lcs {
-				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
-			} else {
+			if lcs {
+				// Drop the source remove first (indices of later
+				// live candidates shift down), consume its
+				// candidate, then insert the move at the snapshot
+				// position (candidates there or later shift up).
+				d.patch = d.patch.remove(idx)
+				d.matcher.consumeRemoveCandidate(idx)
 				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
+				d.matcher.shiftCandidatesFrom(d.snapshotPatchLen, +1)
+			} else {
+				d.patch = d.patch.remove(idx)
+				d.matcher.consumeRemoveCandidate(idx)
+				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
 			}
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	uptr := d.matcher.findUnchanged(v)
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -505,28 +599,11 @@ func (d *Differ) remove(path string, v interface{}) {
 	if d.opts.invertible {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
+	idx := len(d.patch)
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
-}
-
-func (d *Differ) findUnchanged(v interface{}) string {
-	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
-		if ok {
-			return node.ptr
-		}
+	if d.opts.factorize {
+		d.matcher.addRemoveCandidate(idx, v)
 	}
-	return emptyPointer
-}
-
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
-		}
-	}
-	return -1
 }
 
 func hasProperPathPrefix(prefix, path string) bool {
@@ -568,4 +645,15 @@ func insertionSort(v []string) {
 
 func b2s(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
+}
+
+// unorderedDeepEqualSlice reports whether two arrays hold the
+// same elements independently of their order. It is a thin
+// wrapper around the per-comparison matcher; when no comparison
+// session is active it builds one on demand.
+func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
+	if d.matcher == nil {
+		d.beginComparison()
+	}
+	return d.matcher.multisetEqual(src, tgt, d.opts.equivalent)
 }

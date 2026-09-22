@@ -34,13 +34,18 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
-			e := r.(invalidJSONTypeError)
-			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
-			patch = nil
+			if e, ok := r.(invalidJSONTypeError); ok {
+				err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+				patch = nil
+				return
+			}
+			panic(r)
 		}
 	}()
 	d.applyOpts(opts...)
-	d.Compare(source, target)
+	if err = d.compareInternal(source, target); err != nil {
+		return nil, err
+	}
 	patch = d.patch
 
 	return patch, err
@@ -63,7 +68,9 @@ func compare(d *Differ, src, tgt interface{}) (Patch, error) {
 	}
 	d.targetBytes = tb
 
-	d.Compare(si, ti)
+	if err := d.compareInternal(si, ti); err != nil {
+		return nil, err
+	}
 	return d.patch, nil
 }
 
@@ -80,7 +87,9 @@ func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, er
 	}
 	d.targetBytes = tgt
 
-	d.Compare(si, ti)
+	if err := d.compareInternal(si, ti); err != nil {
+		return nil, err
+	}
 	return d.patch, nil
 }
 
