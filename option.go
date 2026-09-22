@@ -89,3 +89,15 @@ func Ignores(ptrs ...string) Option {
 		o.opts.hasIgnore = true
 	}
 }
+
+// WithStats instructs the Differ to copy its diagnostic
+// counters into s at the end of each comparison. The counters
+// are diagnostic only and do not influence the generated
+// patch. A Stats value must not be shared between concurrent
+// comparisons; use a distinct value per call to keep the
+// counters isolated.
+func WithStats(s *Stats) Option {
+	return func(d *Differ) {
+		d.opts.statsOut = s
+	}
+}

@@ -41,7 +41,7 @@ func TestDiffer_Reset(t *testing.T) {
 			buf: make([]byte, 15),
 			sep: 15,
 		},
-		hashmap: map[uint64]jsonNode{
+		hashmap: map[uint64][]jsonNode{
 			1: {},
 		},
 		patch: make([]Operation, 42),
@@ -203,13 +203,13 @@ func TestDiffer_unorderedDeepEqualSlice(t *testing.T) {
 		equal    bool
 	}{
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{3, 2, 1},
+			src:   []interface{}{float64(1), float64(2), float64(3)},
+			tgt:   []interface{}{float64(3), float64(2), float64(1)},
 			equal: true,
 		},
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{4, 3, 2, 1},
+			src:   []interface{}{float64(1), float64(2), float64(3)},
+			tgt:   []interface{}{float64(4), float64(3), float64(2), float64(1)},
 			equal: false,
 		},
 		{
