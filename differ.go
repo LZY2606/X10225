@@ -12,12 +12,16 @@ type Differ struct {
 	hashmap          map[uint64]jsonNode
 	opts             options
 	patch            Patch
+	candHints        []matchHint
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	stats            matchStats
+	digestFn         digestFunc
+	failAt           failPoint
 }
 
 type (
@@ -46,6 +50,7 @@ type jsonNode struct {
 // underlying storage for use by future comparisons.
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
+	d.candHints = d.candHints[:0]
 	d.ptr.reset()
 
 	// Optimized map clear.
@@ -73,6 +78,9 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Diagnostic counters describe this comparison only.
+	d.stats = matchStats{}
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -114,7 +122,7 @@ func (d *Differ) diff(ptr pointer, src, tgt interface{}, doc string) {
 			// of the document, use an add operation to replace
 			// the entire content of the document.
 			// https://tools.ietf.org/html/rfc6902#section-4.1
-			d.patch = d.patch.append(OperationAdd, emptyPointer, ptr.copy(), src, tgt, 0)
+			d.appendOp(OperationAdd, emptyPointer, ptr.copy(), src, tgt, 0)
 		} else {
 			// Values are incomparable, generate a replacement.
 			d.replace(ptr.copy(), src, tgt, doc)
@@ -159,7 +167,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -214,15 +222,15 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// operations that represents the changes between
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
-		d.patch = d.patch[:lastOpIdx]
+		d.truncateOps(lastOpIdx)
 
 		// Allocate a new string for the operation's path.
 		replaceOp.Path = ptr.copy()
 
 		if d.opts.invertible {
-			d.patch = d.patch.append(OperationTest, emptyPointer, replaceOp.Path, nil, src, len(doc))
+			d.appendOp(OperationTest, emptyPointer, replaceOp.Path, nil, src, len(doc))
 		}
-		d.patch = append(d.patch, replaceOp)
+		d.appendOp(replaceOp.Type, emptyPointer, replaceOp.Path, replaceOp.OldValue, replaceOp.Value, replaceOp.valueLen)
 	}
 }
 
@@ -260,11 +268,11 @@ func (d *Differ) compareObjects(ptr pointer, src, tgt map[string]interface{}, do
 			}
 		case inOld:
 			if !d.isIgnored(ptr) {
-				d.remove(ptr.copy(), src[k])
+				d.remove(ptr.copy(), src[k], matchHint{})
 			}
 		case inNew:
 			if !d.isIgnored(ptr) {
-				d.add(ptr.copy(), tgt[k], doc, false)
+				d.add(ptr.copy(), tgt[k], doc, false, matchHint{})
 			}
 		}
 		ptr.rewind()
@@ -290,7 +298,7 @@ func (d *Differ) compareArrays(ptr pointer, src, tgt []interface{}, doc string) 
 			ptr.appendIndex(i)
 
 			if !d.isIgnored(ptr) {
-				d.remove(p, src[i])
+				d.remove(p, src[i], matchHint{})
 			}
 			ptr.rewind()
 		}
@@ -321,7 +329,7 @@ comparisons:
 		for i := ml; i < tl; i++ {
 			ptr.appendIndex(i)
 			if !d.isIgnored(ptr) {
-				d.add(p, tgt[i], doc, false)
+				d.add(p, tgt[i], doc, false, matchHint{})
 			}
 			ptr.rewind()
 		}
@@ -334,8 +342,11 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 			return
 		}
 	}
+	d.checkFailure(failStageLCS)
+
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	matcher := newArrayMatcher(&d.stats, d.digestFn, src, tgt)
+	pairs := matcher.lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -377,7 +388,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				ptr.appendIndex(adjust(ai))
 
 				if !d.isIgnored(ptr) {
-					d.remove(ptr.copy(), src[ai])
+					d.remove(ptr.copy(), src[ai], matchHint{matcher, ai})
 				}
 				ptr.rewind()
 				ai++
@@ -386,7 +397,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				// Opposite case of the previous condition.
 				ptr.appendIndex(bi)
 				if !d.isIgnored(ptr) {
-					d.add(ptr.copy(), tgt[bi], doc, true)
+					d.add(ptr.copy(), tgt[bi], doc, true, matchHint{matcher, bi})
 				}
 				ptr.rewind()
 				bi++
@@ -419,7 +430,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 			ptr.appendIndex(adjust(ai))
 
 			if !d.isIgnored(ptr) {
-				d.remove(ptr.copy(), src[ai])
+				d.remove(ptr.copy(), src[ai], matchHint{matcher, ai})
 			}
 			ptr.rewind()
 			ai++
@@ -427,7 +438,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		default: // bi < len(tgt)
 			ptr.appendIndex(bi)
 			if !d.isIgnored(ptr) {
-				d.add(ptr.copy(), tgt[bi], doc, true)
+				d.add(ptr.copy(), tgt[bi], doc, true, matchHint{matcher, bi})
 			}
 			ptr.rewind()
 			bi++
@@ -440,41 +451,70 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
+	// Group both arrays by the digest of their elements.
+	// The digest is only a prefilter: within each bucket, a
+	// one-to-one matching of deeply-equal values is required.
+	// This makes the check exact for duplicate elements and
+	// safe against hash collisions.
+	srcBuckets := make(map[uint64][]interface{}, len(src))
+	tgtBuckets := make(map[uint64][]interface{}, len(tgt))
 
 	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+		k := d.digest(v, true)
+		srcBuckets[k] = append(srcBuckets[k], v)
 	}
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
+		k := d.digest(v, true)
+		tgtBuckets[k] = append(tgtBuckets[k], v)
+	}
+	if len(srcBuckets) != len(tgtBuckets) {
+		return false
+	}
+	for k, svals := range srcBuckets {
+		tvals, ok := tgtBuckets[k]
+		if !ok || len(tvals) != len(svals) {
 			return false
 		}
-		count--
+		matched := make([]bool, len(tvals))
+		for _, sv := range svals {
+			found := false
+			for j, tv := range tvals {
+				if matched[j] {
+					continue
+				}
+				if d.valuesEqual(sv, tv) {
+					matched[j] = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				// The bucket looked equal by hash, but it
+				// does not hold the same multiset of values.
+				d.stats.collisions++
+				return false
+			}
+		}
 	}
-	return count == 0
+	return true
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
 	vl := len(doc)
 
 	if d.opts.invertible {
-		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, src, vl)
+		d.appendOp(OperationTest, emptyPointer, path, nil, src, vl)
 	}
-	d.patch = d.patch.append(OperationReplace, emptyPointer, path, src, tgt, vl)
+	d.appendOp(OperationReplace, emptyPointer, path, src, tgt, vl)
 }
 
-func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
+func (d *Differ) add(path string, v interface{}, doc string, lcs bool, hint matchHint) {
 	if !d.opts.factorize {
-		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
+		d.appendOp(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	d.checkFailure(failStageMoveCopy)
+	idx := d.findRemoved(v, hint)
 	if idx != -1 {
 		op := d.patch[idx]
 
@@ -483,11 +523,11 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// of the "path" location; i.e., a location cannot
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
-			d.patch = d.patch.remove(idx)
+			d.removeOpAt(idx)
 			if !lcs {
-				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
+				d.appendOp(OperationMove, op.Path, path, v, v, 0)
 			} else {
-				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
+				d.insertOpAt(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
 			}
 		}
 		return
@@ -495,34 +535,58 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 	uptr := d.findUnchanged(v)
 
 	if len(uptr) != 0 && !d.opts.invertible {
-		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
+		d.appendOp(OperationCopy, uptr, path, nil, v, 0)
 	} else {
-		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, len(doc))
+		d.appendOp(OperationAdd, emptyPointer, path, nil, v, len(doc))
 	}
 }
 
-func (d *Differ) remove(path string, v interface{}) {
+func (d *Differ) remove(path string, v interface{}, hint matchHint) {
 	if d.opts.invertible {
-		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
+		d.appendOp(OperationTest, emptyPointer, path, nil, v, 0)
 	}
-	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	d.appendOp(OperationRemove, emptyPointer, path, v, nil, 0)
+	d.candHints[len(d.candHints)-1] = hint
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		k := d.digest(v, false)
 		node, ok := d.hashmap[k]
 		if ok {
+			d.stats.candidates++
+			// A hash match is not a value match: verify
+			// equality so that a digest collision cannot
+			// produce a copy of the wrong value.
+			if !d.valuesEqual(node.val, v) {
+				d.stats.collisions++
+				return emptyPointer
+			}
 			return node.ptr
 		}
 	}
 	return emptyPointer
 }
 
-func (d *Differ) findRemoved(v interface{}) int {
+func (d *Differ) findRemoved(v interface{}, hint matchHint) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		if op.Type != OperationRemove {
+			continue
+		}
+		d.stats.candidates++
+		candHint := d.candHints[i]
+		switch {
+		case candHint.m != nil && hint.m != nil && candHint.m == hint.m:
+			// Both the removed and the added value come from
+			// the same LCS comparison: the equality of the pair
+			// was already computed and memoized by the matcher,
+			// so the candidate is evaluated without doing the
+			// comparison a second time.
+			if candHint.m.equal(candHint.idx, hint.idx) {
+				return i
+			}
+		case d.valuesEqual(op.OldValue, v):
 			return i
 		}
 	}
