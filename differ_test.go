@@ -203,13 +203,13 @@ func TestDiffer_unorderedDeepEqualSlice(t *testing.T) {
 		equal    bool
 	}{
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{3, 2, 1},
+			src:   []interface{}{1.0, 2.0, 3.0},
+			tgt:   []interface{}{3.0, 2.0, 1.0},
 			equal: true,
 		},
 		{
-			src:   []interface{}{1, 2, 3},
-			tgt:   []interface{}{4, 3, 2, 1},
+			src:   []interface{}{1.0, 2.0, 3.0},
+			tgt:   []interface{}{4.0, 3.0, 2.0, 1.0},
 			equal: false,
 		},
 		{
@@ -231,7 +231,7 @@ func TestDiffer_unorderedDeepEqualSlice(t *testing.T) {
 		},
 	} {
 		d := Differ{}
-		eq := d.unorderedDeepEqualSlice(tc.src, tc.tgt)
+		eq := d.newArrayMatcher(tc.src, tc.tgt, true).unorderedEqual()
 		if eq != tc.equal {
 			t.Errorf("equality mismatch, got %t, want %t", eq, tc.equal)
 		}

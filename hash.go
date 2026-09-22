@@ -35,10 +35,13 @@ func (h *hasher) hash(i interface{}, sort bool) {
 	case nil:
 		_ = h.mh.WriteByte('0')
 	case []interface{}:
+		elems := v
 		if sort {
-			h.sortArray(v)
+			// Hash a sorted copy so that unordered digesting
+			// never mutates the caller's slice.
+			elems = h.sortedArray(v)
 		}
-		for _, e := range v {
+		for _, e := range elems {
 			h.hash(e, sort)
 		}
 	case map[string]interface{}:
@@ -58,14 +61,19 @@ func (h *hasher) hash(i interface{}, sort bool) {
 	}
 }
 
-func (h *hasher) sortArray(a []interface{}) {
+// sortedArray returns a copy of a whose elements are
+// ordered by their unordered digest, without mutating a.
+func (h *hasher) sortedArray(a []interface{}) []interface{} {
+	cp := make([]interface{}, len(a))
+	copy(cp, a)
+
 	h1 := hasher{}
 	h2 := hasher{}
 
 	h1.mh.SetSeed(h.mh.Seed())
 	h2.mh.SetSeed(h.mh.Seed())
 
-	slices.SortStableFunc(a, func(a1, a2 interface{}) int {
+	slices.SortStableFunc(cp, func(a1, a2 interface{}) int {
 		d1 := h1.digest(a1, true)
 		d2 := h2.digest(a2, true)
 
@@ -76,4 +84,5 @@ func (h *hasher) sortArray(a []interface{}) {
 		}
 		return 0
 	})
+	return cp
 }
