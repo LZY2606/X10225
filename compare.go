@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -34,8 +35,16 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
-			e := r.(invalidJSONTypeError)
-			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+			switch e := r.(type) {
+			case invalidJSONTypeError:
+				err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+			default:
+				if r == ErrUnsupported {
+					err = ErrUnsupported
+				} else {
+					panic(r)
+				}
+			}
 			patch = nil
 		}
 	}()
@@ -63,8 +72,7 @@ func compare(d *Differ, src, tgt interface{}) (Patch, error) {
 	}
 	d.targetBytes = tb
 
-	d.Compare(si, ti)
-	return d.patch, nil
+	return runCompare(d, si, ti)
 }
 
 func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, error) {
@@ -80,9 +88,30 @@ func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, er
 	}
 	d.targetBytes = tgt
 
-	d.Compare(si, ti)
+	return runCompare(d, si, ti)
+}
+
+// runCompare executes a comparison through the Differ public method
+// and maps internal aborts onto the library error hierarchy. On an
+// abort the Differ has already rolled back its state, so the caller
+// observes no partial patch and can safely retry the exact same
+// comparison.
+func runCompare(d *Differ, src, tgt interface{}) (patch Patch, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if r == ErrUnsupported {
+				patch = nil
+				err = ErrUnsupported
+				return
+			}
+			panic(r)
+		}
+	}()
+	d.Compare(src, tgt)
 	return d.patch, nil
 }
+
+var _ = errors.Is
 
 // marshalUnmarshal returns the result of unmarshaling
 // the JSON representation of the given interface value.

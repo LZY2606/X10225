@@ -35,6 +35,13 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+
+	// am and srcIdx tag a removal emitted during an LCS array
+	// comparison with the matcher that owns its element equality.
+	// They are internal factorization bookkeeping and are never
+	// serialized nor compared by callers.
+	am     *arrayMatcher
+	srcIdx int
 }
 
 // MarshalJSON implements the json.Marshaler interface.
