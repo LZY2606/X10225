@@ -35,6 +35,10 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// moveSeq is an internal, per-comparison identity used to
+	// memoize move-candidate probes. It is never serialized and
+	// does not participate in the public patch representation.
+	moveSeq uint64
 }
 
 // MarshalJSON implements the json.Marshaler interface.
@@ -113,6 +117,22 @@ func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl i
 		Value:    tgt,
 		valueLen: vl,
 	})
+}
+
+// appendSeq is identical to [Patch.append], but it also
+// records the per-comparison identity of the operation, used
+// by the array matcher to memoize move candidates.
+func (p *Patch) appendSeq(typ string, from, path string, src, tgt interface{}, vl int, seq uint64) Patch {
+	op := Operation{
+		Type:     typ,
+		From:     from,
+		Path:     path,
+		OldValue: src,
+		Value:    tgt,
+		valueLen: vl,
+		moveSeq:  seq,
+	}
+	return append(*p, op)
 }
 
 func (p *Patch) insert(pos int, typ string, from, path string, src, tgt interface{}, vl int) Patch {

@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"unsafe"
 )
@@ -18,6 +19,19 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	// matcher is the stack head of the array currently being
+	// compared; nested arrays restore the previous matcher.
+	matcher *arrayMatcher
+	// removeSeq assigns a unique identity to every remove
+	// operation of a comparison, so move-candidate probes can
+	// be memoized per operation even with duplicated values.
+	removeSeq uint64
+	// stats holds the diagnostic comparison counters of the
+	// ongoing (or last) comparison. They never influence the
+	// generated patch.
+	stats matchStats
+	// diag holds unexported, test-only diagnostic seams.
+	diag diagHooks
 }
 
 type (
@@ -73,6 +87,27 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Every comparison starts from a clean diagnostic state
+	// and an empty matcher stack, which also isolates
+	// concurrent comparisons performed on distinct Differs.
+	d.stats = matchStats{}
+	d.removeSeq = 0
+	d.matcher = nil
+	// If the comparison fails halfway through (for example
+	// because an invalid value panics), no partial patch,
+	// prepared hashmap, pointer position or matcher state must
+	// survive: retrying the same inputs after a reset must
+	// produce exactly the same stable result.
+	defer func() {
+		if r := recover(); r != nil {
+			d.patch = nil
+			d.hashmap = nil
+			d.ptr.reset()
+			d.matcher = nil
+			d.stats = matchStats{}
+			panic(r)
+		}
+	}()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,7 +194,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -260,11 +295,11 @@ func (d *Differ) compareObjects(ptr pointer, src, tgt map[string]interface{}, do
 			}
 		case inOld:
 			if !d.isIgnored(ptr) {
-				d.remove(ptr.copy(), src[k])
+				d.remove(ptr.copy(), src[k], -1)
 			}
 		case inNew:
 			if !d.isIgnored(ptr) {
-				d.add(ptr.copy(), tgt[k], doc, false)
+				d.add(ptr.copy(), tgt[k], doc, false, -1)
 			}
 		}
 		ptr.rewind()
@@ -274,6 +309,9 @@ func (d *Differ) compareObjects(ptr pointer, src, tgt map[string]interface{}, do
 // compareArrays generates the patch operations that
 // represents the differences between two JSON arrays.
 func (d *Differ) compareArrays(ptr pointer, src, tgt []interface{}, doc string) {
+	m := d.newArrayMatcher(src, tgt)
+	defer m.release()
+
 	ptr.snapshot()
 	sl, tl := len(src), len(tgt)
 	ml := min(sl, tl)
@@ -290,13 +328,13 @@ func (d *Differ) compareArrays(ptr pointer, src, tgt []interface{}, doc string) 
 			ptr.appendIndex(i)
 
 			if !d.isIgnored(ptr) {
-				d.remove(p, src[i])
+				d.remove(p, src[i], i)
 			}
 			ptr.rewind()
 		}
 		goto comparisons // skip equivalence test since arrays are different
 	}
-	if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
+	if d.opts.equivalent && m.unorderedEqual() {
 		return
 	}
 comparisons:
@@ -321,21 +359,23 @@ comparisons:
 		for i := ml; i < tl; i++ {
 			ptr.appendIndex(i)
 			if !d.isIgnored(ptr) {
-				d.add(p, tgt[i], doc, false)
+				d.add(p, tgt[i], doc, false, i)
 			}
 			ptr.rewind()
 		}
 	}
+	m.foldStats()
 }
 
 func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc string) {
-	if len(src) == len(tgt) {
-		if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
-			return
-		}
+	m := d.newArrayMatcher(src, tgt)
+	defer m.release()
+
+	if d.opts.equivalent && m.unorderedEqual() {
+		return
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := m.lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -377,7 +417,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				ptr.appendIndex(adjust(ai))
 
 				if !d.isIgnored(ptr) {
-					d.remove(ptr.copy(), src[ai])
+					d.remove(ptr.copy(), src[ai], ai)
 				}
 				ptr.rewind()
 				ai++
@@ -386,7 +426,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				// Opposite case of the previous condition.
 				ptr.appendIndex(bi)
 				if !d.isIgnored(ptr) {
-					d.add(ptr.copy(), tgt[bi], doc, true)
+					d.add(ptr.copy(), tgt[bi], doc, true, bi)
 				}
 				ptr.rewind()
 				bi++
@@ -419,7 +459,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 			ptr.appendIndex(adjust(ai))
 
 			if !d.isIgnored(ptr) {
-				d.remove(ptr.copy(), src[ai])
+				d.remove(ptr.copy(), src[ai], ai)
 			}
 			ptr.rewind()
 			ai++
@@ -427,37 +467,28 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		default: // bi < len(tgt)
 			ptr.appendIndex(bi)
 			if !d.isIgnored(ptr) {
-				d.add(ptr.copy(), tgt[bi], doc, true)
+				d.add(ptr.copy(), tgt[bi], doc, true, bi)
 			}
 			ptr.rewind()
 			bi++
 			adds++
 		}
 	}
+	m.foldStats()
+	if d.diag.hook != nil {
+		d.diag.hook(phaseMatcherEnd, ptr)
+	}
 }
 
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	// Kept as the historical entry point; the comparison is
+	// performed by the unified matcher, whose multiplicity-aware
+	// bucket matching also rejects digest collisions through
+	// deepEqual instead of trusting equal digests.
+	m := d.newStandaloneMatcher(src, tgt)
+	equal := m.unorderedEqual()
+	m.foldStats()
+	return equal
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -469,12 +500,23 @@ func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
 	d.patch = d.patch.append(OperationReplace, emptyPointer, path, src, tgt, vl)
 }
 
-func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
+func (d *Differ) add(path string, v interface{}, doc string, lcs bool, tgtIdx int) {
 	if !d.opts.factorize {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	var idx int
+	if d.matcher != nil && tgtIdx >= 0 {
+		// Move candidate discovery goes through the current
+		// array matcher, so each (removed element, new element)
+		// pair is compared at most once.
+		idx = d.matcher.findRemoved(tgtIdx)
+	} else {
+		// Object additions (or elements of nested structures
+		// compared outside the current array matcher) keep the
+		// historical value-based scan.
+		idx = d.findRemoved(v)
+	}
 	if idx != -1 {
 		op := d.patch[idx]
 
@@ -487,12 +529,28 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 			if !lcs {
 				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
 			} else {
-				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
+				// Moves are discovered while emitting the LCS
+				// walk from left to right, but RFC 6902 applies
+				// the resulting patch in order. They must be
+				// executed by descending destination path:
+				// moving into a later slot first cannot shift
+				// the slots referenced by subsequent moves. The
+				// historical discovery order only happened to
+				// match this when every move consumed the same
+				// source index; crossing moves with different
+				// "from" values were applied at shifted indexes
+				// and produced the wrong array.
+				d.insertMove(path, op.Path, v)
 			}
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	var uptr string
+	if d.matcher != nil && tgtIdx >= 0 {
+		uptr = d.matcher.findUnchanged(tgtIdx)
+	} else {
+		uptr = d.findUnchanged(v)
+	}
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -501,18 +559,19 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 	}
 }
 
-func (d *Differ) remove(path string, v interface{}) {
+func (d *Differ) remove(path string, v interface{}, tgtIdx int) {
 	if d.opts.invertible {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
-	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	d.removeSeq++
+	d.patch = d.patch.appendSeq(OperationRemove, emptyPointer, path, v, nil, 0, d.removeSeq)
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		k := d.digest(v, false)
 		node, ok := d.hashmap[k]
-		if ok {
+		if ok && deepEqual(node.val, v) {
 			return node.ptr
 		}
 	}
@@ -540,6 +599,42 @@ func hasProperPathPrefix(prefix, path string) bool {
 		return false
 	}
 	return path[len(prefix)] == separator
+}
+
+// insertMove places a new move operation in the block of moves
+// generated for the current LCS array (starting at
+// snapshotPatchLen) so that moves are ordered by ascending
+// destination array index. Non-move operations emitted earlier
+// (test operations for invertible patches) are skipped. This is
+// the execution order under which crossing moves reconstruct
+// the target array per RFC 6902.
+func (d *Differ) insertMove(path, from string, v interface{}) {
+	idx := d.movePathIndex(path)
+	pos := d.snapshotPatchLen
+	for pos < len(d.patch) {
+		op := d.patch[pos]
+		if op.Type != OperationMove {
+			pos++
+			continue
+		}
+		if d.movePathIndex(op.Path) < idx {
+			break
+		}
+		pos++
+	}
+	d.patch = d.patch.insert(pos, OperationMove, from, path, v, v, 0)
+}
+
+// movePathIndex extracts the trailing array index of a JSON
+// pointer path. Moves generated for LCS arrays always end with
+// an array index fragment.
+func (d *Differ) movePathIndex(path string) int {
+	i := strings.LastIndexByte(path, separator)
+	n, err := strconv.Atoi(path[i+1:])
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func (d *Differ) applyOpts(opts ...Option) {
