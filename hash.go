@@ -36,7 +36,7 @@ func (h *hasher) hash(i interface{}, sort bool) {
 		_ = h.mh.WriteByte('0')
 	case []interface{}:
 		if sort {
-			h.sortArray(v)
+			h.sortSlice(v)
 		}
 		for _, e := range v {
 			h.hash(e, sort)
@@ -58,7 +58,7 @@ func (h *hasher) hash(i interface{}, sort bool) {
 	}
 }
 
-func (h *hasher) sortArray(a []interface{}) {
+func (h *hasher) sortSlice(a []interface{}) {
 	h1 := hasher{}
 	h2 := hasher{}
 
