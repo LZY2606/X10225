@@ -16,6 +16,7 @@ type Differ struct {
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	match            matchState
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -47,6 +48,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.resetMatch()
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -73,6 +75,30 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.ptr.reset()
+	d.resetMatch()
+
+	// A comparison builds candidates and diagnostics in
+	// per-run scratch state only. If array matching is
+	// aborted, roll back the operations emitted during
+	// this run and the factorize entries indexed during
+	// the prepare pass, so that the Differ is left exactly
+	// as it was before the call and can be retried with
+	// identical inputs.
+	startPatchLen := len(d.patch)
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(*matcherAbortError); ok {
+				d.patch = d.patch[:startPatchLen]
+				for _, k := range d.match.prepared {
+					delete(d.hashmap, k)
+				}
+				d.resetMatch()
+			}
+			panic(r)
+		}
+	}()
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,7 +185,10 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digestAt(hashSite{
+			path:   "prepare:" + ptr.string(),
+			sorted: false,
+		}, tgt)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -167,6 +196,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 			ptr: ptr.copy(),
 			val: tgt,
 		}
+		d.match.prepared = append(d.match.prepared, k)
 		return
 	}
 	// At this point, the source and target values
