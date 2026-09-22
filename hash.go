@@ -8,10 +8,26 @@ import (
 )
 
 type hasher struct {
-	mh maphash.Hash
+	mh   maphash.Hash
+	hook digestHookFunc
 }
 
+// digestHookFunc allows tests to observe a real hash computation
+// and to rewrite its result (e.g. to force a collision). The next
+// callback runs the unmodified production digest.
+type digestHookFunc func(val interface{}, sort bool, next func() uint64) uint64
+
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
+	if h.hook != nil {
+		// The hook only observes/rewrites the result of the
+		// production computation; it cannot bypass it.
+		real := func() uint64 {
+			h.mh.Reset()
+			h.hash(val, sort)
+			return h.mh.Sum64()
+		}
+		return h.hook(val, sort, real)
+	}
 	h.mh.Reset()
 	h.hash(val, sort)
 
