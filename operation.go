@@ -35,6 +35,11 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// digest caches the hash of OldValue for remove
+	// operations during factorization, so that each move
+	// candidate is hashed at most once. It is diagnostic and
+	// internal and is never serialized.
+	digest uint64
 }
 
 // MarshalJSON implements the json.Marshaler interface.
@@ -112,6 +117,18 @@ func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl i
 		OldValue: src,
 		Value:    tgt,
 		valueLen: vl,
+	})
+}
+
+// appendRemove appends a remove operation, caching the
+// digest of its old value when it has already been computed.
+func (p *Patch) appendRemove(path string, v interface{}, dg uint64) Patch {
+	return append(*p, Operation{
+		Type:     OperationRemove,
+		From:     emptyPointer,
+		Path:     path,
+		OldValue: v,
+		digest:   dg,
 	})
 }
 

@@ -36,7 +36,9 @@ func (h *hasher) hash(i interface{}, sort bool) {
 		_ = h.mh.WriteByte('0')
 	case []interface{}:
 		if sort {
-			h.sortArray(v)
+			// Unordered equivalence hashes arrays as sorted
+			// multisets at every nesting level.
+			v = h.sortedElements(v, sort)
 		}
 		for _, e := range v {
 			h.hash(e, sort)
@@ -58,16 +60,22 @@ func (h *hasher) hash(i interface{}, sort bool) {
 	}
 }
 
-func (h *hasher) sortArray(a []interface{}) {
+// sortedElements returns the array elements reordered by
+// their digest, so that arrays differing only in order hash
+// identically when sort is true.
+func (h *hasher) sortedElements(a []interface{}, sort bool) []interface{} {
 	h1 := hasher{}
 	h2 := hasher{}
 
 	h1.mh.SetSeed(h.mh.Seed())
 	h2.mh.SetSeed(h.mh.Seed())
 
-	slices.SortStableFunc(a, func(a1, a2 interface{}) int {
-		d1 := h1.digest(a1, true)
-		d2 := h2.digest(a2, true)
+	// Sort a copy of the array: hashing must never mutate the
+	// value being compared, which remains owned by the caller.
+	cp := append([]interface{}(nil), a...)
+	slices.SortStableFunc(cp, func(a1, a2 interface{}) int {
+		d1 := h1.digest(a1, sort)
+		d2 := h2.digest(a2, sort)
 
 		if d1 > d2 {
 			return 1
@@ -76,4 +84,5 @@ func (h *hasher) sortArray(a []interface{}) {
 		}
 		return 0
 	})
+	return cp
 }
