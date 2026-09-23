@@ -76,7 +76,8 @@ func Test_lcs(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pairs := lcs(tc.src, tc.tgt)
+			d := Differ{}
+			pairs := newMatcher(&d, tc.src, tc.tgt).lcs()
 			if !reflect.DeepEqual(pairs, tc.pairs) {
 				t.Errorf("got %v, want %v", pairs, tc.pairs)
 			}

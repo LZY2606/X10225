@@ -35,6 +35,7 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	oldHash  uint64
 }
 
 // MarshalJSON implements the json.Marshaler interface.
