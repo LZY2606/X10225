@@ -10,12 +10,24 @@ import (
 // The zero value is an empty generator ready to use.
 type Differ struct {
 	hashmap          map[uint64]jsonNode
+	hashCollisions   map[uint64][]jsonNode
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	moves            candidateIndex
+	diag             matchDiagnostics
+	// matcherHook, when non-nil, is invoked at well-defined
+	// stages of array matching. It is unexported and used by
+	// in-package tests to inject a recoverable failure.
+	matcherHook func(matcherHookStage)
+	// hashOverride, when non-nil, replaces the hash used to
+	// bucket values. It is unexported and used by in-package
+	// tests to force hash collisions; collision buckets are
+	// always resolved with deep equality.
+	hashOverride func(v interface{}, sort bool) (uint64, bool)
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -52,6 +64,11 @@ func (d *Differ) Reset() {
 	for k := range d.hashmap {
 		delete(d.hashmap, k)
 	}
+	for k := range d.hashCollisions {
+		delete(d.hashCollisions, k)
+	}
+	d.moves.reset()
+	d.diag = matchDiagnostics{}
 }
 
 // WithOpts applies the given options to the Differ
@@ -73,6 +90,10 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Diagnostic counters and the move candidate index are
+	// scoped to a single comparison only.
+	d.diag = matchDiagnostics{}
+	d.moves.reset()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,14 +180,23 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.valueDigest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
-		d.hashmap[k] = jsonNode{
+		node := jsonNode{
 			ptr: ptr.copy(),
 			val: tgt,
 		}
+		if cur, ok := d.hashmap[k]; ok && !deepEqual(cur.val, tgt) {
+			// Hash collision: keep every distinct value so
+			// that a later copy lookup is always resolved
+			// with deep equality instead of pairing
+			// unrelated values.
+			d.registerCollision(k, cur, node)
+			return
+		}
+		d.hashmap[k] = node
 		return
 	}
 	// At this point, the source and target values
@@ -185,7 +215,16 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		oobj := vsrc
 		nobj := tgt.(map[string]interface{})
 
-		for k, v1 := range oobj {
+		// Iterate keys in lexicographical order so that the
+		// registration order of equal values sharing a hash
+		// is stable across runs.
+		keys := make([]string, 0, len(oobj))
+		for k := range oobj {
+			keys = append(keys, k)
+		}
+		sortStrings(keys)
+		for _, k := range keys {
+			v1 := oobj[k]
 			if v2, ok := nobj[k]; ok {
 				p := ptr.clone()
 				p.appendKey(k)
@@ -440,24 +479,50 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
 
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+	// Compare multisets rather than sets: duplicate values
+	// must be accounted for. Hash buckets only pre-filter
+	// values; every match is confirmed with deep equality, so
+	// hash collisions cannot equate distinct elements.
+	type counter struct {
+		val   interface{}
+		count int
 	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
+	buckets := make(map[uint64][]*counter, len(src))
+
+	incr := func(v interface{}, delta int) bool {
+		k := d.valueDigest(v, d.opts.equivalent)
+		for _, c := range buckets[k] {
+			d.diag.candidateChecks++
+			if deepEqual(c.val, v) {
+				c.count += delta
+				return true
+			}
+			d.diag.hashCollisions++
+		}
+		if delta < 0 {
 			return false
 		}
-		count--
+		buckets[k] = append(buckets[k], &counter{val: v, count: delta})
+		return true
 	}
-	return count == 0
+
+	for _, v := range src {
+		incr(v, 1)
+	}
+	for _, v := range tgt {
+		if !incr(v, -1) {
+			return false
+		}
+	}
+	for _, b := range buckets {
+		for _, c := range b {
+			if c.count != 0 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
