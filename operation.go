@@ -35,6 +35,9 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// candID links a remove operation to its removalLedger
+	// entry. It is unexported and never serialized.
+	candID int
 }
 
 // MarshalJSON implements the json.Marshaler interface.
@@ -112,6 +115,17 @@ func (p *Patch) append(typ string, from, path string, src, tgt interface{}, vl i
 		OldValue: src,
 		Value:    tgt,
 		valueLen: vl,
+	})
+}
+
+// appendRemove records a remove operation and links it to its
+// removalLedger candidate id.
+func (p *Patch) appendRemove(path string, v interface{}, id int) Patch {
+	return append(*p, Operation{
+		Type:     OperationRemove,
+		Path:     path,
+		OldValue: v,
+		candID:   id,
 	})
 }
 

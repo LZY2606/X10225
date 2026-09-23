@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"hash/maphash"
 	"math"
 	"slices"
@@ -10,6 +11,19 @@ import (
 type hasher struct {
 	mh maphash.Hash
 }
+
+// Type tags prefix each hashed scalar/container so that values
+// of distinct JSON types can never share a digest. Without them,
+// e.g. JSON null and the boolean false both hashed as the byte
+// '0' and collided.
+const (
+	tagString byte = 's'
+	tagBool   byte = 'b'
+	tagNumber byte = 'n'
+	tagNull   byte = 'z'
+	tagArray  byte = '['
+	tagObject byte = '{'
+)
 
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
 	h.mh.Reset()
@@ -21,20 +35,27 @@ func (h *hasher) digest(val interface{}, sort bool) uint64 {
 func (h *hasher) hash(i interface{}, sort bool) {
 	switch v := i.(type) {
 	case string:
+		_ = h.mh.WriteByte(tagString)
 		_, _ = h.mh.WriteString(v)
 	case bool:
+		_ = h.mh.WriteByte(tagBool)
 		if v {
 			_ = h.mh.WriteByte('1')
 		} else {
 			_ = h.mh.WriteByte('0')
 		}
 	case float64:
+		_ = h.mh.WriteByte(tagNumber)
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
 		_, _ = h.mh.Write(buf[:])
+	case json.Number:
+		_ = h.mh.WriteByte(tagNumber)
+		_, _ = h.mh.WriteString(v.String())
 	case nil:
-		_ = h.mh.WriteByte('0')
+		_ = h.mh.WriteByte(tagNull)
 	case []interface{}:
+		_ = h.mh.WriteByte(tagArray)
 		if sort {
 			h.sortArray(v)
 		}
@@ -42,6 +63,7 @@ func (h *hasher) hash(i interface{}, sort bool) {
 			h.hash(e, sort)
 		}
 	case map[string]interface{}:
+		_ = h.mh.WriteByte(tagObject)
 		keys := make([]string, 0, len(v))
 
 		// Extract keys first, and sort them

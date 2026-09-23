@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/json"
+	"reflect"
 	"strconv"
 )
 
@@ -61,6 +62,20 @@ func deepEqual(src, tgt interface{}) bool {
 		return true
 	}
 	return deepEqualValue(src, tgt)
+}
+
+// matcherDeepEqual settles equality for the array matcher.
+// Values that flow through the public entries are always
+// json.Unmarshal products, i.e. valid JSON types, for which
+// this is exactly deepEqual. The reflect fallback only covers
+// non-JSON Go types passed straight to internal helpers; the
+// hash prefilter cannot distinguish those because they share a
+// zero digest. It never alters results for valid JSON values.
+func matcherDeepEqual(src, tgt interface{}) bool {
+	if jsonTypeSwitch(src) == jsonInvalid || jsonTypeSwitch(tgt) == jsonInvalid {
+		return reflect.DeepEqual(src, tgt)
+	}
+	return deepEqual(src, tgt)
 }
 
 func deepEqualValue(src, tgt interface{}) bool {
