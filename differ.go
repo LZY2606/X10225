@@ -15,7 +15,8 @@ type Differ struct {
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
-	hasher           hasher
+	hasher           hashEngine
+	stats            Stats
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -47,6 +48,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats = Stats{}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -70,9 +72,43 @@ func (d *Differ) Patch() Patch {
 	return d.patch
 }
 
+// Stats returns a copy of the diagnostic counters of the
+// last comparison performed by the Differ instance.
+// See the documentation of the Stats type for details.
+func (d *Differ) Stats() Stats {
+	return d.stats
+}
+
+// digestOf returns the digest of the given value, and
+// accounts for it in the diagnostic counters. The digest
+// of each candidate value is computed once and reused by
+// the array matching and the move/copy discovery.
+func (d *Differ) digestOf(v interface{}, sort bool) uint64 {
+	if d.hasher == nil {
+		d.hasher = &hasher{}
+	}
+	d.stats.Digests++
+	return d.hasher.digest(v, sort)
+}
+
+// confirmEquality reports whether the values src and tgt,
+// whose digests are known to be equal, are deeply equal.
+// The deep equality check is the authoritative comparison:
+// it guarantees that distinct values are never paired by a
+// hash collision.
+func (d *Differ) confirmEquality(src, tgt interface{}) bool {
+	d.stats.Equalities++
+	if deepEqual(src, tgt) {
+		return true
+	}
+	d.stats.Collisions++
+	return false
+}
+
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats = Stats{}
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,7 +195,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digestOf(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -335,7 +371,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.lcsPairs(src, tgt)
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -440,24 +476,25 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
+	// The digests of the source elements are accounted for
+	// with their multiplicity, so that duplicate values are
+	// paired one-to-one with the target elements instead of
+	// being collapsed into a set.
+	counts := make(map[uint64]int, len(src))
 	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+		counts[d.digestOf(v, d.opts.equivalent)]++
 	}
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digestOf(v, d.opts.equivalent)
 		// If the digest hash is not in the comparison set,
+		// or all its occurrences have already been paired,
 		// return early.
-		if _, ok := diff[k]; !ok {
+		if counts[k] == 0 {
 			return false
 		}
-		count--
+		counts[k]--
 	}
-	return count == 0
+	return true
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -474,7 +511,11 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	// The digest of the added value is computed once and
+	// shared by the move and copy candidate lookups.
+	hv := d.digestOf(v, false)
+
+	idx := d.findRemoved(v, hv)
 	if idx != -1 {
 		op := d.patch[idx]
 
@@ -492,7 +533,7 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	uptr := d.findUnchanged(hv)
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -506,12 +547,19 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Hash the removed value once, so that it can be
+		// matched against future additions without being
+		// hashed again for each candidate lookup.
+		op := &d.patch[len(d.patch)-1]
+		op.oldHash = d.digestOf(v, false)
+		op.hasOldHash = true
+	}
 }
 
-func (d *Differ) findUnchanged(v interface{}) string {
+func (d *Differ) findUnchanged(hv uint64) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
+		node, ok := d.hashmap[hv]
 		if ok {
 			return node.ptr
 		}
@@ -519,10 +567,22 @@ func (d *Differ) findUnchanged(v interface{}) string {
 	return emptyPointer
 }
 
-func (d *Differ) findRemoved(v interface{}) int {
+// findRemoved returns the index of the first remove operation
+// of the patch whose value is deeply equal to v, or -1 if there
+// is none. The digest hv of v, computed once by the caller, is
+// used to select the candidates; each candidate is confirmed
+// with a deep equality check so that a hash collision can never
+// pair distinct values.
+func (d *Differ) findRemoved(v interface{}, hv uint64) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		if op.Type != OperationRemove {
+			continue
+		}
+		if op.hasOldHash && op.oldHash != hv {
+			continue
+		}
+		if d.confirmEquality(op.OldValue, v) {
 			return i
 		}
 	}

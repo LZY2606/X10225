@@ -7,6 +7,20 @@ import (
 	"slices"
 )
 
+// hashEngine computes the digest of a JSON value. It is the
+// single seam through which the array matching (LCS), the
+// move/copy candidate discovery and the equivalence checks
+// obtain value digests, so that candidates are hashed once
+// and confirmed by deep equality.
+//
+// The production implementation is the maphash-based hasher
+// below; the interface only exists to let internal tests
+// exercise the collision-handling of the shared matching
+// logic. It is unexported and not part of the public API.
+type hashEngine interface {
+	digest(val interface{}, sort bool) uint64
+}
+
 type hasher struct {
 	mh maphash.Hash
 }
