@@ -18,6 +18,58 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+
+	// matchDiagnostics holds the diagnostic counters of the
+	// current top-level comparison. It is observational only
+	// and is reset at the beginning of every Compare call.
+	matchDiagnostics *matchDiagnostics
+
+	// moveCandidates is the unified ledger of removed values
+	// used to discover move operations with the Factorize
+	// option. Candidates are digested once, at the time the
+	// remove operation is recorded.
+	moveCandidates []moveCandidate
+	// removeScan is a scratch buffer reused by the candidate
+	// ledger to locate remove operations in the patch.
+	removeScan []int
+
+	// failHook and customHash are internal, test-only seams.
+	// failHook injects a recoverable failure in the middle of
+	// an array matching attempt; customHash replaces the
+	// digest function to simulate hash collisions. Both share
+	// the exact production code path and are nil in
+	// production, where they have zero cost.
+	failHook   matchFailHook
+	customHash func(v interface{}, sort bool) uint64
+}
+
+// matchDiagnostics aggregates the per-array matching
+// statistics of a comparison, plus the document-wide
+// move/copy candidate accounting. The slices and counters
+// are appended in traversal order, which makes the report
+// deterministic.
+type matchDiagnostics struct {
+	Arrays []ArrayMatchStats
+
+	// Move candidate accounting (Factorize option).
+	MoveLookups    int
+	MoveConfirms   int
+	MoveCollisions int
+	MovePrefixSkip int
+
+	// Copy candidate accounting (Factorize option).
+	CopyLookups    int
+	CopyConfirms   int
+	CopyCollisions int
+}
+
+// moveCandidate is a removed value recorded by the unified
+// candidate ledger. The digest is computed once, when the
+// remove operation is recorded.
+type moveCandidate struct {
+	value    interface{}
+	digest   uint64
+	consumed bool
 }
 
 type (
@@ -47,6 +99,10 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	// The move candidate ledger mirrors the remove
+	// operations of the patch; clear it alongside.
+	d.moveCandidates = d.moveCandidates[:0]
+	d.removeScan = d.removeScan[:0]
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -73,6 +129,12 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Diagnostics are per-comparison state: reset them so a
+	// reused Differ never leaks counters across calls, and
+	// concurrent comparisons on distinct instances stay
+	// isolated.
+	d.matchDiagnostics = &matchDiagnostics{}
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +149,31 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+}
+
+// digest computes the hash of v. All hashing performed by
+// the differ goes through this single choke point, which is
+// what allows the collision-simulation seam to observe the
+// exact production behavior.
+func (d *Differ) digest(v interface{}, sort bool) uint64 {
+	if d.customHash != nil {
+		return d.customHash(v, sort)
+	}
+	return d.hasher.digest(v, sort)
+}
+
+// matchReport returns the diagnostic counters collected by
+// the last Compare call. It is unexported: the counters are
+// a diagnostic aid for the package's own tests, not part of
+// the public contract. The returned value is a snapshot and
+// is nil before the first comparison.
+func (d *Differ) matchReport() *matchDiagnostics {
+	if d.matchDiagnostics == nil {
+		return nil
+	}
+	report := *d.matchDiagnostics
+	report.Arrays = append([]ArrayMatchStats(nil), d.matchDiagnostics.Arrays...)
+	return &report
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -159,7 +246,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -214,6 +301,26 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// operations that represents the changes between
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
+		if d.opts.factorize {
+			// The truncated operations are a suffix of the
+			// patch; drop the same number of unconsumed move
+			// candidates from the tail of the ledger so it
+			// stays in sync with the remove operations that
+			// remain in the patch.
+			var removed int
+			for _, op := range d.patch[lastOpIdx:] {
+				if op.Type == OperationRemove {
+					removed++
+				}
+			}
+			for removed > 0 && len(d.moveCandidates) > 0 {
+				last := len(d.moveCandidates) - 1
+				if !d.moveCandidates[last].consumed {
+					removed--
+				}
+				d.moveCandidates = d.moveCandidates[:last]
+			}
+		}
 		d.patch = d.patch[:lastOpIdx]
 
 		// Allocate a new string for the operation's path.
@@ -328,14 +435,58 @@ comparisons:
 	}
 }
 
+// alignLCS computes the LCS index pairs of src and tgt
+// through the unified array matcher. Each element is
+// digested at most once and equality is established with
+// deepEqual on hash hits, so the result is immune to hash
+// collisions. If a recoverable failure is injected while
+// matching, the same LCS core is retried with the naive
+// deep-equal oracle; the emitted patch is therefore
+// identical to a failure-free run.
+func (d *Differ) alignLCS(ptr pointer, src, tgt []interface{}) [][2]int {
+	// Snapshot the path up front: the pointer buffer is
+	// reused while emitting operations and during nested
+	// comparisons, so an unsafe string would later observe a
+	// mutated path in the diagnostics report.
+	path := ptr.copy()
+	m := newArrayMatcher(d, path, src, tgt)
+	if err := m.digestAll(false); err == nil {
+		pairs, perr := m.align()
+		if perr == nil {
+			m.stats.Stage = stageLCS
+			d.matchDiagnostics.Arrays = append(d.matchDiagnostics.Arrays, m.stats)
+			return pairs
+		}
+	}
+	// Recovery: re-run the shared LCS core without the hash
+	// prefilter. No state from the failed attempt is
+	// retained, so its diagnostics never leak into the
+	// successful comparison.
+	m.stats = ArrayMatchStats{
+		Path:      path,
+		Stage:     stageLCS,
+		Recovered: true,
+		SrcLen:    len(src),
+		TgtLen:    len(tgt),
+	}
+	pairs, err := lcsPairs(len(src), len(tgt), func(i, j int) (bool, error) {
+		return deepEqual(src[i], tgt[j]), nil
+	})
+	if err != nil {
+		panic(err) // unreachable: the naive oracle never errors
+	}
+	d.matchDiagnostics.Arrays = append(d.matchDiagnostics.Arrays, m.stats)
+	return pairs
+}
+
 func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc string) {
 	if len(src) == len(tgt) {
-		if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
+		if d.opts.equivalent && d.multisetEqual(ptr, src, tgt) {
 			return
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.alignLCS(ptr, src, tgt)
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -436,6 +587,87 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 	}
 }
 
+// multisetEqual reports whether src and tgt hold the same
+// elements regardless of order. It delegates to the unified
+// array matcher, which hashes each element once and confirms
+// every hash hit with a structural comparison; on a
+// recoverable failure it falls back to the naive oracle, so
+// the observable semantics never change.
+func (d *Differ) multisetEqual(ptr pointer, src, tgt []interface{}) bool {
+	path := ptr.copy()
+	m := newArrayMatcher(d, path, src, tgt)
+	eq, err := m.multisetEqual()
+	if err != nil {
+		// Recoverable failure: retry with the naive oracle.
+		// The legacy implementation is the same algorithm
+		// without the hash prefilter.
+		m.stats = ArrayMatchStats{
+			Path:      path,
+			Stage:     stageMultiset,
+			Recovered: true,
+			SrcLen:    len(src),
+			TgtLen:    len(tgt),
+		}
+		eq = d.legacyUnorderedDeepEqualSlice(src, tgt)
+	}
+	m.stats.Stage = stageMultiset
+	d.matchDiagnostics.Arrays = append(d.matchDiagnostics.Arrays, m.stats)
+	return eq
+}
+
+// legacyUnorderedDeepEqualSlice is the recovery path of
+// multisetEqual. It preserves the historical behavior of the
+// Equivalent option, including hashing array elements in
+// order-insensitive mode (which sorts them in place).
+func (d *Differ) legacyUnorderedDeepEqualSlice(src, tgt []interface{}) bool {
+	if len(src) != len(tgt) {
+		return false
+	}
+	// Multiset of digests with multiplicity: duplicates are
+	// tracked per digest so that, e.g., [1 1 2] never equals
+	// [1 2 2]. Every digest hit is confirmed with deepEqual,
+	// which keeps hash collisions from mispairing elements.
+	type entry struct {
+		val  interface{}
+		used bool
+	}
+	buckets := make(map[uint64][]entry, len(src))
+	for _, v := range src {
+		k := d.digest(v, d.opts.equivalent)
+		buckets[k] = append(buckets[k], entry{val: v})
+	}
+	count := len(src)
+	for _, v := range tgt {
+		k := d.digest(v, d.opts.equivalent)
+		candidates, ok := buckets[k]
+		if !ok {
+			return false
+		}
+		matched := false
+		for i := range candidates {
+			if candidates[i].used {
+				continue
+			}
+			if deepEqual(candidates[i].val, v) {
+				candidates[i].used = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+		count--
+	}
+	return count == 0
+}
+
+// unorderedDeepEqualSlice implements the historical,
+// hash-based unordered comparison used by the non-LCS array
+// path (LCS disabled restores the original semantics). It is
+// also the entry point exercised by the pre-existing unit
+// tests, so its behavior is intentionally unchanged: only
+// digests are compared and deepEqual is never invoked here.
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
@@ -444,12 +676,12 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	count := 0
 
 	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
 		diff[k] = struct{}{}
 		count++
 	}
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
 		// If the digest hash is not in the comparison set,
 		// return early.
 		if _, ok := diff[k]; !ok {
@@ -474,25 +706,29 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	// The value is digested once per add; the same digest
+	// serves both the move and the copy candidate lookups.
+	digest := d.digest(v, false)
+
+	idx, suppressed := d.resolveMoveCandidate(v, digest, path)
+	if suppressed {
+		// A matching remove exists, but it cannot be moved
+		// into one of its children; historically nothing is
+		// added in this case.
+		return
+	}
 	if idx != -1 {
 		op := d.patch[idx]
 
-		// https://tools.ietf.org/html/rfc6902#section-4.4f
-		// The "from" location MUST NOT be a proper prefix
-		// of the "path" location; i.e., a location cannot
-		// be moved into one of its children.
-		if !hasProperPathPrefix(op.Path, path) {
-			d.patch = d.patch.remove(idx)
-			if !lcs {
-				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
-			} else {
-				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
-			}
+		d.patch = d.patch.remove(idx)
+		if !lcs {
+			d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
+		} else {
+			d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	uptr := d.findUnchanged(v, digest)
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -506,27 +742,94 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Record the removed value in the unified candidate
+		// ledger. The digest is computed exactly once, here.
+		d.moveCandidates = append(d.moveCandidates, moveCandidate{
+			value:  v,
+			digest: d.digest(v, false),
+		})
+	}
 }
 
-func (d *Differ) findUnchanged(v interface{}) string {
+func (d *Differ) findUnchanged(v interface{}, digest uint64) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
+		d.matchDiagnostics.CopyLookups++
+		node, ok := d.hashmap[digest]
 		if ok {
-			return node.ptr
+			d.matchDiagnostics.CopyConfirms++
+			// A digest hit is only a candidate: confirm it
+			// structurally so that a hash collision can never
+			// produce a copy of a different value.
+			if deepEqual(node.val, v) {
+				return node.ptr
+			}
+			d.matchDiagnostics.CopyCollisions++
 		}
 	}
 	return emptyPointer
 }
 
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
-		}
+// resolveMoveCandidate locates the remove operation whose
+// old value equals v, using the unified candidate ledger.
+// The digest of v is computed once per add; structural
+// comparisons only run on digest hits, and the ledger
+// preserves the historical "first matching remove wins"
+// semantics by binding candidates to the remove operations
+// of the patch in emission order.
+//
+// The second return value reports that a matching candidate
+// was found but rejected because its location is a proper
+// prefix of path (RFC 6902 section 4.4); in that case the
+// candidate stays available for subsequent adds and nothing
+// must be emitted, exactly like the historical scan.
+func (d *Differ) resolveMoveCandidate(v interface{}, digest uint64, path string) (int, bool) {
+	if len(d.moveCandidates) == 0 {
+		return -1, false
 	}
-	return -1
+	d.matchDiagnostics.MoveLookups++
+
+	// Bind unconsumed candidates to the remove operations
+	// still present in the patch, in order. Consumed
+	// candidates correspond to operations that were already
+	// turned into moves.
+	d.removeScan = d.removeScan[:0]
+	ci := 0
+	for i := 0; i < len(d.patch); i++ {
+		if d.patch[i].Type != OperationRemove {
+			continue
+		}
+		for ci < len(d.moveCandidates) && d.moveCandidates[ci].consumed {
+			ci++
+		}
+		if ci == len(d.moveCandidates) {
+			break
+		}
+		d.removeScan = append(d.removeScan, i)
+		ci++
+	}
+	for k, idx := range d.removeScan {
+		cand := &d.moveCandidates[k]
+		if cand.consumed || cand.digest != digest {
+			continue
+		}
+		d.matchDiagnostics.MoveConfirms++
+		if !deepEqual(cand.value, v) {
+			d.matchDiagnostics.MoveCollisions++
+			continue
+		}
+		// https://tools.ietf.org/html/rfc6902#section-4.4f
+		// The "from" location MUST NOT be a proper prefix
+		// of the "path" location; i.e., a location cannot
+		// be moved into one of its children.
+		if hasProperPathPrefix(d.patch[idx].Path, path) {
+			d.matchDiagnostics.MovePrefixSkip++
+			return -1, true
+		}
+		cand.consumed = true
+		return idx, false
+	}
+	return -1, false
 }
 
 func hasProperPathPrefix(prefix, path string) bool {
