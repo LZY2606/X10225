@@ -18,6 +18,15 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	match            *matchContext
+
+	// digestFn is an unexported test seam that replaces the
+	// production digest computation. It shares the exact same
+	// matching logic as the production path; only the digest
+	// value itself is replaced. The boolean result reports
+	// whether the digest is usable: false makes the matcher
+	// fall back to exact comparisons instead of guessing.
+	digestFn func(val any, sort bool) (uint64, bool)
 }
 
 type (
@@ -47,6 +56,9 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	if d.match != nil {
+		d.match.reset()
+	}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -73,6 +85,7 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.beginComparison()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +100,42 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+}
+
+// beginComparison initializes the per-comparison matching
+// state. A fresh matchContext (and fresh diagnostics) is used
+// for every comparison, so concurrent comparisons on distinct
+// Differ instances and retries after a failed comparison never
+// observe leftover counters, candidate entries or caches.
+func (d *Differ) beginComparison() {
+	if d.match == nil {
+		d.match = newMatchContext(d.digestValue)
+	} else {
+		d.match.reset()
+		d.match.digester = d.digestValue
+	}
+}
+
+// matchStats returns a copy of the diagnostics recorded while
+// matching arrays during the latest comparison. It is
+// unexported and intended for diagnostics and regression tests;
+// the counters never influence the generated patch.
+func (d *Differ) matchStats() matchDiagnostics {
+	if d.match == nil || d.match.stats == nil {
+		return matchDiagnostics{}
+	}
+	return *d.match.stats
+}
+
+// digestValue is the single entry point used to hash values
+// during a comparison: equality prefiltering, factorization
+// cache and equivalence detection all rely on it. The boolean
+// result reports whether the digest is usable.
+func (d *Differ) digestValue(val any, sort bool) (uint64, bool) {
+	if d.digestFn != nil {
+		return d.digestFn(val, sort)
+	}
+	return d.hasher.digest(val, sort), true
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
