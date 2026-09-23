@@ -29,6 +29,13 @@ func (h *hasher) hash(i interface{}, sort bool) {
 			_ = h.mh.WriteByte('0')
 		}
 	case float64:
+		// Normalize negative zero so that values which
+		// compare equal with deepEqual always share the
+		// same digest. This guarantees that a digest
+		// mismatch is a reliable proof of inequality.
+		if v == 0 {
+			v = 0
+		}
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
 		_, _ = h.mh.Write(buf[:])

@@ -10,12 +10,14 @@ import (
 // The zero value is an empty generator ready to use.
 type Differ struct {
 	hashmap          map[uint64]jsonNode
+	removedDigests   map[int]uint64
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	stats            Stats
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -47,6 +49,8 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats = Stats{}
+	d.removedDigests = nil
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -70,9 +74,16 @@ func (d *Differ) Patch() Patch {
 	return d.patch
 }
 
+// Stats returns the diagnostic counters collected during
+// the last comparison. See the Stats type for details.
+func (d *Differ) Stats() Stats {
+	return d.stats
+}
+
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats = Stats{}
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -215,6 +226,7 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
 		d.patch = d.patch[:lastOpIdx]
+		d.removedDigests = nil
 
 		// Allocate a new string for the operation's path.
 		replaceOp.Path = ptr.copy()
@@ -335,7 +347,10 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	matcher := newArrayMatcher(&d.hasher, src, tgt)
+	pairs := matcher.lcs()
+	d.stats.EqualComparisons += matcher.comparisons
+	d.stats.HashCollisions += matcher.collisions
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -484,10 +499,12 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
 			d.patch = d.patch.remove(idx)
+			d.removedDigests = nil
 			if !lcs {
 				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
 			} else {
 				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
+				d.removedDigests = nil
 			}
 		}
 		return
@@ -520,11 +537,41 @@ func (d *Differ) findUnchanged(v interface{}) string {
 }
 
 func (d *Differ) findRemoved(v interface{}) int {
+	if len(d.patch) == 0 {
+		return -1
+	}
+	var k uint64
+	var hashed bool
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		if op.Type != OperationRemove {
+			continue
+		}
+		if !hashed {
+			k = d.hasher.digest(v, false)
+			hashed = true
+		}
+		// The digest of each remove operation is computed
+		// once and cached until the patch is structurally
+		// modified. A digest mismatch proves inequality,
+		// while a match is verified with deepEqual so that
+		// a hash collision cannot pair distinct values.
+		h, ok := d.removedDigests[i]
+		if !ok {
+			h = d.hasher.digest(op.OldValue, false)
+			if d.removedDigests == nil {
+				d.removedDigests = make(map[int]uint64)
+			}
+			d.removedDigests[i] = h
+		}
+		if h != k {
+			continue
+		}
+		d.stats.EqualComparisons++
+		if deepEqual(op.OldValue, v) {
 			return i
 		}
+		d.stats.HashCollisions++
 	}
 	return -1
 }
