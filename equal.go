@@ -63,6 +63,26 @@ func deepEqual(src, tgt interface{}) bool {
 	return deepEqualValue(src, tgt)
 }
 
+// validateJSONValue panics with an invalidJSONTypeError if v,
+// or any value nested within it, holds a type that is not a
+// valid JSON type. It is used at the boundaries of the array
+// matching logic, where hash digests replace the systematic
+// deep comparisons that would otherwise reject such values.
+func validateJSONValue(v interface{}) {
+	switch jsonTypeSwitch(v) {
+	case jsonInvalid:
+		panic(invalidJSONTypeError{t: v})
+	case jsonArray:
+		for _, e := range v.([]interface{}) {
+			validateJSONValue(e)
+		}
+	case jsonObject:
+		for _, e := range v.(map[string]interface{}) {
+			validateJSONValue(e)
+		}
+	}
+}
+
 func deepEqualValue(src, tgt interface{}) bool {
 	st := jsonTypeSwitch(src)
 	if st == jsonInvalid {

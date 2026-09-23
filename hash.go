@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"hash/maphash"
 	"math"
 	"slices"
@@ -29,11 +30,18 @@ func (h *hasher) hash(i interface{}, sort bool) {
 			_ = h.mh.WriteByte('0')
 		}
 	case float64:
+		// Normalize negative zero so that the digest stays
+		// consistent with deep equality, for which -0 == 0.
+		if v == 0 {
+			v = 0
+		}
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
 		_, _ = h.mh.Write(buf[:])
 	case nil:
 		_ = h.mh.WriteByte('0')
+	case json.Number:
+		_, _ = h.mh.WriteString(string(v))
 	case []interface{}:
 		if sort {
 			h.sortArray(v)
