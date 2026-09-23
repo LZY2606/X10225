@@ -35,6 +35,12 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// oldHash is the digest of OldValue for remove operations.
+	// It is used as a prefilter when discovering move candidates,
+	// and travels with the operation so that insertions, removals
+	// and rationalization cannot desynchronize the candidate
+	// accounting from the patch content.
+	oldHash uint64
 }
 
 // MarshalJSON implements the json.Marshaler interface.

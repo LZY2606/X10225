@@ -18,6 +18,7 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	stats            diffStats
 }
 
 type (
@@ -73,7 +74,16 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Reset the diagnostic counters of every comparison, and
+	// drop the move/copy candidates registered by a previous
+	// comparison. A comparison must never carry state left
+	// over by an earlier one, including a comparison that
+	// failed midway through.
+	d.stats = diffStats{}
 	if d.opts.factorize {
+		for k := range d.hashmap {
+			delete(d.hashmap, k)
+		}
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
 	}
@@ -160,6 +170,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		return
 	} else if deepEqual(src, tgt) {
 		k := d.hasher.digest(tgt, false)
+		d.stats.hashes++
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -185,11 +196,19 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		oobj := vsrc
 		nobj := tgt.(map[string]interface{})
 
-		for k, v1 := range oobj {
+		// Iterate over the object keys in sorted order so that
+		// values registered more than once always resolve to a
+		// deterministic candidate location.
+		keys := make([]string, 0, len(oobj))
+		for k := range oobj {
+			keys = append(keys, k)
+		}
+		sortStrings(keys)
+		for _, k := range keys {
 			if v2, ok := nobj[k]; ok {
 				p := ptr.clone()
 				p.appendKey(k)
-				d.prepare(p, v1, v2)
+				d.prepare(p, oobj[k], v2)
 			}
 		}
 	default:
@@ -335,7 +354,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := newArrayMatcher(src, tgt, false, &d.stats).lcs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -440,24 +459,11 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	// Delegate to the recursive unordered/equivalent matching:
+	// it buckets elements by digest and verifies every candidate,
+	// which preserves the documented Equivalent semantics while
+	// making the check collision-safe and multiplicity-safe.
+	return d.equivalentEqual(src, tgt)
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -506,23 +512,52 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Record the digest of the removed value on the operation,
+		// so that move candidates are computed once and looked up
+		// in the stable order of the patch. The digest is only a
+		// prefilter; candidates are always verified by equality.
+		d.stats.hashes++
+		d.patch[len(d.patch)-1].oldHash = d.hasher.digest(v, false)
+	}
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
-	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
-		if ok {
-			return node.ptr
-		}
+	if d.hashmap == nil {
+		return emptyPointer
 	}
-	return emptyPointer
+	k := d.hasher.digest(v, false)
+	d.stats.hashes++
+	node, ok := d.hashmap[k]
+	if !ok {
+		return emptyPointer
+	}
+	// Verify the candidate: a matching digest is necessary but
+	// not sufficient for equality, and hash collisions must never
+	// pair two different values with a copy operation.
+	d.stats.candidates++
+	if !deepEqual(node.val, v) {
+		return emptyPointer
+	}
+	return node.ptr
 }
 
 func (d *Differ) findRemoved(v interface{}) int {
+	if len(d.patch) == 0 {
+		return -1
+	}
+	k := d.hasher.digest(v, false)
+	d.stats.hashes++
 	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		op := &d.patch[i]
+		if op.Type != OperationRemove || op.oldHash != k {
+			continue
+		}
+		// Verify the candidate instead of trusting the digest,
+		// so that hash collisions can never pair two different
+		// values with a move operation.
+		d.stats.candidates++
+		if deepEqual(op.OldValue, v) {
 			return i
 		}
 	}
