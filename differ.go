@@ -18,6 +18,14 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	run              *compareRun
+	// digestHook, when non-nil, replaces the production
+	// digest implementation. It is unexported and exists
+	// exclusively to let the regression tests construct
+	// deterministic hash-collision inputs through the public
+	// comparison entry points; the matching and move/copy
+	// logic exercised in that case is the production code.
+	digestHook func(interface{}, bool) uint64
 }
 
 type (
@@ -47,6 +55,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.run = nil
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -73,6 +82,7 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.beginRun()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,14 +169,15 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
-		if d.hashmap == nil {
-			d.hashmap = make(map[uint64]jsonNode)
-		}
-		d.hashmap[k] = jsonNode{
+		node := jsonNode{
 			ptr: ptr.copy(),
 			val: tgt,
 		}
+		k := d.run.digestOf(d, tgt, false)
+		d.hashmap[k] = node
+		// Keep the run-local, collision-aware candidate index
+		// in sync with the public factorize index.
+		d.run.registerUnchanged(k, node)
 		return
 	}
 	// At this point, the source and target values
@@ -335,7 +346,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.newArrayMatcher(src, tgt, false, true).lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -440,24 +451,12 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	// The digest is used with the unordered/sorted mode and
+	// only as a prefilter: the matcher confirms every
+	// candidate with deep equality and matches each target
+	// occurrence at most once, which preserves multiplicities
+	// and is immune to hash collisions.
+	return d.newArrayMatcher(src, tgt, d.opts.equivalent, true).multisetEqual()
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -474,9 +473,10 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	idx := d.run.matchRemoved(d, v)
 	if idx != -1 {
 		op := d.patch[idx]
+		opSeq := op.opSeq
 
 		// https://tools.ietf.org/html/rfc6902#section-4.4f
 		// The "from" location MUST NOT be a proper prefix
@@ -489,10 +489,11 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 			} else {
 				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
 			}
+			d.run.consumeRemoved(opSeq)
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	uptr := d.run.findUnchangedCandidate(d, v)
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -503,30 +504,13 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 
 func (d *Differ) remove(path string, v interface{}) {
 	if d.opts.invertible {
-		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
+		d.patch = d.patch.appendSeq(d.run.nextSeq(), OperationTest, emptyPointer, path, nil, v, 0)
 	}
-	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
-}
-
-func (d *Differ) findUnchanged(v interface{}) string {
-	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
-		if ok {
-			return node.ptr
-		}
+	seq := d.run.nextSeq()
+	d.patch = d.patch.appendSeq(seq, OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		d.run.registerRemoval(d, seq, v)
 	}
-	return emptyPointer
-}
-
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
-		}
-	}
-	return -1
 }
 
 func hasProperPathPrefix(prefix, path string) bool {
