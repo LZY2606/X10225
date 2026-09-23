@@ -9,15 +9,26 @@ import (
 // A Differ generates JSON Patch (RFC 6902).
 // The zero value is an empty generator ready to use.
 type Differ struct {
-	hashmap          map[uint64]jsonNode
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
-	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+
+	// Per-comparison state. It is created by beginCompare and
+	// discarded by endCompare/discardCompare, so counters and
+	// candidate caches never leak across calls, successful or
+	// not. It is nil outside of a comparison.
+	match *matchState
+	// Fault configuration for the test-only, internal failure
+	// hook. Production options never touch it.
+	fault matchFaultSpec
+	// diag/diagOK hold the diagnostics of the last successful
+	// comparison.
+	diag   MatchDiagnostics
+	diagOK bool
 }
 
 type (
@@ -47,11 +58,46 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.match = nil
+	d.diag = MatchDiagnostics{}
+	d.diagOK = false
+}
 
-	// Optimized map clear.
-	for k := range d.hashmap {
-		delete(d.hashmap, k)
-	}
+// LastMatchDiagnostics returns the diagnostic counters recorded
+// by the array matching pipeline during the most recent
+// successful comparison.
+//
+// The counters are diagnostic-only: they have no effect on the
+// generated patch. They are reset for every comparison, and a
+// comparison that fails before completion publishes no
+// diagnostics.
+func (d *Differ) LastMatchDiagnostics() (MatchDiagnostics, bool) {
+	return d.diag, d.diagOK
+}
+
+// beginCompare starts a comparison by installing a fresh,
+// isolated per-call state.
+func (d *Differ) beginCompare() {
+	d.match = &matchState{fault: d.fault}
+	d.diagOK = false
+}
+
+// discardCompare removes every transient artifact of a
+// comparison that did not complete successfully: the per-call
+// state (counters, digest caches, candidate buckets and the
+// failure hook position) is dropped and the patch is truncated
+// back to its initial length.
+func (d *Differ) discardCompare(base int) {
+	d.match = nil
+	d.patch = d.patch[:base]
+}
+
+// endCompare publishes the diagnostics of a successful
+// comparison and releases its transient state.
+func (d *Differ) endCompare() {
+	d.diag = d.match.diagnostics()
+	d.diagOK = true
+	d.match = nil
 }
 
 // WithOpts applies the given options to the Differ
