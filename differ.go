@@ -10,6 +10,9 @@ import (
 // The zero value is an empty generator ready to use.
 type Differ struct {
 	hashmap          map[uint64]jsonNode
+	candidates       candidateIndex
+	stats            matcherStats
+	hooks            matcherHooks
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
@@ -47,6 +50,8 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats = matcherStats{}
+	d.candidates.reset()
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -58,7 +63,9 @@ func (d *Differ) Reset() {
 // instance and returns it to allow chained calls.
 func (d *Differ) WithOpts(opts ...Option) *Differ {
 	for _, o := range opts {
-		o(d)
+		if o != nil {
+			o(d)
+		}
 	}
 	return d
 }
@@ -73,6 +80,44 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// The array-matching diagnostics and the move/copy
+	// candidate registry are scoped to a single comparison.
+	d.stats = matcherStats{}
+	d.candidates.reset()
+	d.candidates.at = d
+	d.candidates.h = &d.hasher
+	d.candidates.stats = &d.stats
+
+	// Snapshot the state that may be mutated before the
+	// comparison runs. If an array matching fails mid-run,
+	// the comparison is rolled back to these snapshots, so
+	// no half-built patch, candidate, digest map or counter
+	// update escapes the failed call.
+	snapshotPatch := d.patch
+	snapshotHashMap := make(map[uint64]jsonNode, len(d.hashmap))
+	for k, n := range d.hashmap {
+		snapshotHashMap[k] = n
+	}
+	snapshotPtr := d.ptr
+
+	success := false
+	defer func() {
+		if r := recover(); r != nil {
+			d.patch = snapshotPatch
+			d.hashmap = snapshotHashMap
+			d.ptr = snapshotPtr
+			d.candidates.reset()
+			d.candidates.at = d
+			d.candidates.h = &d.hasher
+			d.candidates.stats = &d.stats
+			d.stats = matcherStats{}
+			panic(r)
+		}
+		if success {
+			return
+		}
+	}()
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,7 +132,14 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+	success = true
 }
+
+// Len implements patchView for the candidate registry.
+func (d *Differ) len() int { return len(d.patch) }
+
+// Op implements patchView for the candidate registry.
+func (d *Differ) op(i int) *Operation { return &d.patch[i] }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
 	// Fast path, inlined map check.
@@ -214,6 +266,9 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// operations that represents the changes between
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
+		// Discard move candidates that belonged to the
+		// operations that are about to be replaced.
+		d.candidates.truncate(lastOpIdx)
 		d.patch = d.patch[:lastOpIdx]
 
 		// Allocate a new string for the operation's path.
@@ -335,7 +390,8 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	m := d.newArrayMatcher(src, tgt, false)
+	pairs := m.lcs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -437,27 +493,10 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 }
 
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	// Unordered equality is resolved by the unified matcher:
+	// digests only narrow the search, while multiplicities and
+	// collisions are settled by recursive equality.
+	return d.newArrayMatcher(src, tgt, true).multisetEqual()
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -474,8 +513,8 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
-	if idx != -1 {
+	idx, found := d.candidates.find(v)
+	if found {
 		op := d.patch[idx]
 
 		// https://tools.ietf.org/html/rfc6902#section-4.4f
@@ -483,12 +522,20 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// of the "path" location; i.e., a location cannot
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
+			d.candidates.deleted(idx)
 			d.patch = d.patch.remove(idx)
 			if !lcs {
+				pos := len(d.patch)
 				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
+				// Appending does not shift earlier candidates.
+				d.candidates.shift(pos, len(d.patch))
 			} else {
 				d.patch = d.patch.insert(d.snapshotPatchLen, OperationMove, op.Path, path, v, v, 0)
+				d.candidates.inserted(d.snapshotPatchLen)
 			}
+		} else {
+			// The candidate cannot be recycled, but it stays
+			// available for later additions, as before.
 		}
 		return
 	}
@@ -506,27 +553,21 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Register the candidate once, with its digest.
+		d.candidates.remove(len(d.patch)-1, v)
+	}
 }
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
 		k := d.hasher.digest(v, false)
 		node, ok := d.hashmap[k]
-		if ok {
+		if ok && deepEqual(node.val, v) {
 			return node.ptr
 		}
 	}
 	return emptyPointer
-}
-
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
-		}
-	}
-	return -1
 }
 
 func hasProperPathPrefix(prefix, path string) bool {

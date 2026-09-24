@@ -2,8 +2,29 @@ package jsondiff
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
+
+// ErrArrayMatchingInterrupted is the public error reported
+// when an array comparison fails mid-run through the
+// package-internal diagnostic failure injection. The
+// comparison is rolled back atomically, and retrying with
+// the same input yields the stable, expected result.
+var ErrArrayMatchingInterrupted = errors.New("jsondiff: array matching was interrupted")
+
+// errMatcherPanic translates an internal, recoverable
+// matching panic into an error belonging to the package's
+// error model, leaving other panics propagate unchanged.
+func errMatcherPanic(r any) error {
+	if f, ok := r.(matcherFault); ok {
+		return fmt.Errorf("%w (at pair %d)", ErrArrayMatchingInterrupted, f.at)
+	}
+	if e, ok := r.(invalidJSONTypeError); ok {
+		return fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+	}
+	panic(r)
+}
 
 // Compare compares the JSON representations of the
 // given values and returns the differences relative
@@ -34,8 +55,7 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
-			e := r.(invalidJSONTypeError)
-			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
+			err = errMatcherPanic(r)
 			patch = nil
 		}
 	}()
@@ -67,33 +87,25 @@ func compare(d *Differ, src, tgt interface{}) (Patch, error) {
 	return d.patch, nil
 }
 
-func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, error) {
+func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (patch Patch, err error) {
 	if unmarshal == nil {
 		unmarshal = json.Unmarshal
 	}
 	var si, ti interface{}
-	if err := unmarshal(src, &si); err != nil {
+	if err = unmarshal(src, &si); err != nil {
 		return nil, err
 	}
-	if err := unmarshal(tgt, &ti); err != nil {
+	if err = unmarshal(tgt, &ti); err != nil {
 		return nil, err
 	}
 	d.targetBytes = tgt
 
+	defer func() {
+		if r := recover(); r != nil {
+			err = errMatcherPanic(r)
+			patch = nil
+		}
+	}()
 	d.Compare(si, ti)
 	return d.patch, nil
-}
-
-// marshalUnmarshal returns the result of unmarshaling
-// the JSON representation of the given interface value.
-func marshalUnmarshal(v any, opts options) (interface{}, []byte, error) {
-	b, err := opts.marshal(v)
-	if err != nil {
-		return nil, nil, err
-	}
-	var i interface{}
-	if err := opts.unmarshal(b, &i); err != nil {
-		return nil, nil, err
-	}
-	return i, b, nil
 }
