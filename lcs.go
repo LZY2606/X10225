@@ -5,6 +5,19 @@ package jsondiff
 // is, the indices into the source and target slices
 // where the LCS items are located
 func lcs(src, tgt []interface{}) [][2]int {
+	// The package-level function is a thin wrapper around
+	// the Differ method of the same name, so that internal
+	// tests exercise the exact logic used by the production
+	// comparison path.
+	var d Differ
+	return d.lcs(src, tgt)
+}
+
+// lcs is the Differ method backing the package-level
+// function of the same name. It uses the equal method of
+// the Differ to compare the elements, which accounts the
+// comparisons in the diagnostic counters.
+func (d *Differ) lcs(src, tgt []interface{}) [][2]int {
 	t := make([][]int, len(src)+1)
 
 	for i := 0; i <= len(src); i++ {
@@ -12,7 +25,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 	}
 	for i := 1; i < len(t); i++ {
 		for j := 1; j < len(t[i]); j++ {
-			if deepEqual(src[i-1], tgt[j-1]) {
+			if d.equal(src[i-1], tgt[j-1]) {
 				t[i][j] = t[i-1][j-1] + 1
 			} else {
 				t[i][j] = max(t[i-1][j], t[i][j-1])
@@ -24,7 +37,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 
 	for i > 0 && j > 0 {
 		switch {
-		case deepEqual(src[i-1], tgt[j-1]):
+		case d.equal(src[i-1], tgt[j-1]):
 			s = append(s, [2]int{i - 1, j - 1})
 			i--
 			j--

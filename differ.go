@@ -10,12 +10,15 @@ import (
 // The zero value is an empty generator ready to use.
 type Differ struct {
 	hashmap          map[uint64]jsonNode
+	removals         []*removal
+	removalIdx       map[uint64][]*removal
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	stats            Stats
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -42,15 +45,31 @@ type jsonNode struct {
 	ptr string
 }
 
+// A removal describes a remove operation emitted during
+// the current comparison. Removals are registered so that
+// a subsequent addition of an equal value can discover
+// the removal as a move candidate by hash, instead of
+// scanning the patch with deep-equality comparisons.
+type removal struct {
+	hash  uint64
+	path  string
+	value interface{}
+}
+
 // Reset resets the Differ to be empty, but it retains the
 // underlying storage for use by future comparisons.
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.removals = d.removals[:0]
+	d.stats = Stats{}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
 		delete(d.hashmap, k)
+	}
+	for k := range d.removalIdx {
+		delete(d.removalIdx, k)
 	}
 }
 
@@ -73,6 +92,7 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats = Stats{}
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -121,7 +141,7 @@ func (d *Differ) diff(ptr pointer, src, tgt interface{}, doc string) {
 		}
 		return
 	}
-	if deepEqual(src, tgt) {
+	if d.equal(src, tgt) {
 		return
 	}
 	// Save the current size of the patch to detect later
@@ -142,7 +162,7 @@ func (d *Differ) diff(ptr pointer, src, tgt interface{}, doc string) {
 	default:
 		// Generate a replace operation for
 		// scalar types.
-		if !deepEqual(src, tgt) {
+		if !d.equal(src, tgt) {
 			d.replace(ptr.copy(), src, tgt, doc)
 			return
 		}
@@ -158,8 +178,8 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	// the location indexed by the value hash.
 	if !areComparable(src, tgt) {
 		return
-	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+	} else if d.equal(src, tgt) {
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -214,6 +234,19 @@ func (d *Differ) rationalize(ptr pointer, src, tgt interface{}, lastOpIdx int, d
 	// operations that represents the changes between
 	// the two objects, replace the last operations.
 	if curLen > replaceOp.jsonLength() {
+		if d.opts.factorize {
+			// Discard the removals registered for the
+			// remove operations that are truncated, so
+			// that the registry stays in sync with the
+			// remove operations left in the patch.
+			var n int
+			for i := lastOpIdx; i < len(d.patch); i++ {
+				if d.patch[i].Type == OperationRemove {
+					n++
+				}
+			}
+			d.removals = d.removals[:len(d.removals)-n]
+		}
 		d.patch = d.patch[:lastOpIdx]
 
 		// Allocate a new string for the operation's path.
@@ -335,7 +368,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.lcs(src, tgt)
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -444,12 +477,12 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	count := 0
 
 	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
 		diff[k] = struct{}{}
 		count++
 	}
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
 		// If the digest hash is not in the comparison set,
 		// return early.
 		if _, ok := diff[k]; !ok {
@@ -474,7 +507,11 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		d.patch = d.patch.append(OperationAdd, emptyPointer, path, nil, v, 0)
 		return
 	}
-	idx := d.findRemoved(v)
+	// Compute the digest of the value once, and use it to
+	// discover both the move and copy candidates.
+	h := d.digest(v, false)
+
+	idx, r := d.findRemoved(h, v)
 	if idx != -1 {
 		op := d.patch[idx]
 
@@ -484,6 +521,7 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		// be moved into one of its children.
 		if !hasProperPathPrefix(op.Path, path) {
 			d.patch = d.patch.remove(idx)
+			d.consumeRemoval(idx, r)
 			if !lcs {
 				d.patch = d.patch.append(OperationMove, op.Path, path, v, v, 0)
 			} else {
@@ -492,7 +530,7 @@ func (d *Differ) add(path string, v interface{}, doc string, lcs bool) {
 		}
 		return
 	}
-	uptr := d.findUnchanged(v)
+	uptr := d.findUnchanged(h, v)
 
 	if len(uptr) != 0 && !d.opts.invertible {
 		d.patch = d.patch.append(OperationCopy, uptr, path, nil, v, 0)
@@ -506,27 +544,105 @@ func (d *Differ) remove(path string, v interface{}) {
 		d.patch = d.patch.append(OperationTest, emptyPointer, path, nil, v, 0)
 	}
 	d.patch = d.patch.append(OperationRemove, emptyPointer, path, v, nil, 0)
+	if d.opts.factorize {
+		// Register the removal so that a subsequent addition
+		// of an equal value can be factorized into a move
+		// operation. The digest of the value is computed
+		// once, here, and the removals are kept in the same
+		// order as the remove operations of the patch.
+		h := d.digest(v, false)
+		r := &removal{hash: h, path: path, value: v}
+		if d.removalIdx == nil {
+			d.removalIdx = make(map[uint64][]*removal)
+		}
+		d.removalIdx[h] = append(d.removalIdx[h], r)
+		d.removals = append(d.removals, r)
+	}
 }
 
-func (d *Differ) findUnchanged(v interface{}) string {
+// findUnchanged returns the path of an unchanged value
+// equal to v, recorded during the preparation phase, or
+// an empty string. The hash candidate is systematically
+// verified with a deep-equality comparison, so that
+// distinct values with colliding digests are never
+// mismatched.
+func (d *Differ) findUnchanged(hash uint64, v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
+		node, ok := d.hashmap[hash]
 		if ok {
-			return node.ptr
+			if d.equal(node.val, v) {
+				return node.ptr
+			}
+			d.stats.Collisions++
 		}
 	}
 	return emptyPointer
 }
 
-func (d *Differ) findRemoved(v interface{}) int {
-	for i := 0; i < len(d.patch); i++ {
-		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+// findRemoved returns the index of the first remove
+// operation of the patch whose value is equal to v, or
+// -1 if there is none. The candidates are looked up by
+// hash in the registry of removals, in the order they
+// were registered, and confirmed with a deep-equality
+// comparison; therefore the result is strictly identical
+// to a linear scan of the patch, but the comparison is
+// only paid for colliding candidates.
+func (d *Differ) findRemoved(hash uint64, v interface{}) (int, *removal) {
+	for _, r := range d.removalIdx[hash] {
+		if !d.equal(r.value, v) {
+			d.stats.Collisions++
+			continue
+		}
+		rank := slices.Index(d.removals, r)
+		if rank == -1 {
+			// Stale entry; the remove operation was
+			// discarded by rationalization.
+			d.pruneRemoval(r)
+			continue
+		}
+		// The removals are kept in the same order as the
+		// remove operations of the patch; locate the
+		// operation that corresponds to the candidate.
+		idx := -1
+		for i := range d.patch {
+			if d.patch[i].Type == OperationRemove {
+				if rank == 0 {
+					idx = i
+					break
+				}
+				rank--
+			}
+		}
+		if idx == -1 {
+			d.pruneRemoval(r)
+			continue
+		}
+		return idx, r
+	}
+	return -1, nil
+}
+
+// consumeRemoval discards the removal associated with the
+// remove operation at the given patch index, after the
+// operation itself has been removed from the patch.
+func (d *Differ) consumeRemoval(idx int, r *removal) {
+	var rank int
+	for i := 0; i < idx; i++ {
+		if d.patch[i].Type == OperationRemove {
+			rank++
 		}
 	}
-	return -1
+	d.removals = slices.Delete(d.removals, rank, rank+1)
+	d.pruneRemoval(r)
+}
+
+// pruneRemoval removes a stale entry from the hash index
+// of removals.
+func (d *Differ) pruneRemoval(r *removal) {
+	bucket := d.removalIdx[r.hash]
+	if i := slices.Index(bucket, r); i != -1 {
+		d.removalIdx[r.hash] = slices.Delete(bucket, i, i+1)
+	}
 }
 
 func hasProperPathPrefix(prefix, path string) bool {
