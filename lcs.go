@@ -3,8 +3,11 @@ package jsondiff
 // lcs computes the longest common subsequence of two
 // slices and returns the index pairs of the LCS, that
 // is, the indices into the source and target slices
-// where the LCS items are located
-func lcs(src, tgt []interface{}) [][2]int {
+// where the LCS items are located.
+// Each equality evaluation is accounted in the Differ's
+// diagnostic counters; every pair of indices is evaluated
+// at most once.
+func (d *Differ) lcs(src, tgt []interface{}) [][2]int {
 	t := make([][]int, len(src)+1)
 
 	for i := 0; i <= len(src); i++ {
@@ -12,7 +15,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 	}
 	for i := 1; i < len(t); i++ {
 		for j := 1; j < len(t[i]); j++ {
-			if deepEqual(src[i-1], tgt[j-1]) {
+			if d.equal(src[i-1], tgt[j-1]) {
 				t[i][j] = t[i-1][j-1] + 1
 			} else {
 				t[i][j] = max(t[i-1][j], t[i][j-1])
@@ -24,7 +27,7 @@ func lcs(src, tgt []interface{}) [][2]int {
 
 	for i > 0 && j > 0 {
 		switch {
-		case deepEqual(src[i-1], tgt[j-1]):
+		case d.equal(src[i-1], tgt[j-1]):
 			s = append(s, [2]int{i - 1, j - 1})
 			i--
 			j--
