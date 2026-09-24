@@ -18,6 +18,43 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+
+	// Per-comparison diagnostics. They are reset at the start
+	// of every Compare call, so concurrent comparisons that use
+	// distinct Differ instances are fully isolated.
+	diag arrayStats
+	// nextTag assigns unique tags to remove operations emitted
+	// while matching an array, so move discovery can route the
+	// value comparison through the matcher's memoized matrix.
+	nextTag int
+	// activeMatcher is the matcher of the array currently being
+	// compared, or nil outside of an LCS array comparison.
+	activeMatcher *arrayMatcher
+
+	// Test-only seams, nil in production. The digest function
+	// replaces element digests while still going through the
+	// exact same matching/LCS code path; it cannot force a pair
+	// to be considered equal because matching digests are always
+	// confirmed with deepEqual. The fault pointer makes the
+	// active matcher panic after n comparisons.
+	digestFunc func(interface{}) uint64
+	faultAfter *int
+}
+
+// arrayStats carries diagnostics about array matching for a
+// single Compare invocation. Counters are diagnostic only and
+// never influence the generated patch.
+type arrayStats struct {
+	// EqualCalls is the number of authoritative old/new value
+	// comparisons performed through deepEqual.
+	EqualCalls int
+	// DigestCalls is the number of element digests computed as
+	// comparison pre-filters; each element is digested at most
+	// once per array.
+	DigestCalls int
+	// HashSkips is the number of old/new pairs ruled out solely
+	// because their digests differ.
+	HashSkips int
 }
 
 type (
@@ -73,6 +110,9 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.diag = arrayStats{}
+	d.nextTag = 0
+	d.activeMatcher = nil
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +127,25 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+}
+
+// elementDigest returns the digest used to group potentially
+// equal values while comparing arrays. The optional test-only
+// override shares the production path; a digest is never taken
+// as proof of equality by itself.
+func (d *Differ) elementDigest(v interface{}) uint64 {
+	d.diag.DigestCalls++
+	if d.digestFunc != nil {
+		return d.digestFunc(v)
+	}
+	return d.hasher.digest(v, false)
+}
+
+// countEqual performs an authoritative equality comparison and
+// accounts it in the per-invocation diagnostics.
+func (d *Differ) countEqual(src, tgt interface{}) bool {
+	d.diag.EqualCalls++
+	return deepEqual(src, tgt)
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -335,7 +394,18 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	matcher := newArrayMatcher(src, tgt)
+	if d.faultAfter != nil {
+		matcher.faultAfter = *d.faultAfter
+	}
+	pairs := matcher.pairs(d)
+
+	// Publish the matcher so move candidates discovered while
+	// emitting this array's operations reuse its equality matrix.
+	parentMatcher := d.activeMatcher
+	d.activeMatcher = matcher
+	defer func() { d.activeMatcher = parentMatcher }()
+
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -377,7 +447,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 				ptr.appendIndex(adjust(ai))
 
 				if !d.isIgnored(ptr) {
-					d.remove(ptr.copy(), src[ai])
+					d.removeTagged(ptr.copy(), matcher, ai, src[ai])
 				}
 				ptr.rewind()
 				ai++
@@ -385,9 +455,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 			default: // bi < mb
 				// Opposite case of the previous condition.
 				ptr.appendIndex(bi)
-				if !d.isIgnored(ptr) {
-					d.add(ptr.copy(), tgt[bi], doc, true)
-				}
+				d.addLCS(ptr.copy(), matcher, bi, tgt[bi], doc)
 				ptr.rewind()
 				bi++
 				adds++
@@ -419,16 +487,14 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 			ptr.appendIndex(adjust(ai))
 
 			if !d.isIgnored(ptr) {
-				d.remove(ptr.copy(), src[ai])
+				d.removeTagged(ptr.copy(), matcher, ai, src[ai])
 			}
 			ptr.rewind()
 			ai++
 			removes++
 		default: // bi < len(tgt)
 			ptr.appendIndex(bi)
-			if !d.isIgnored(ptr) {
-				d.add(ptr.copy(), tgt[bi], doc, true)
-			}
+			d.addLCS(ptr.copy(), matcher, bi, tgt[bi], doc)
 			ptr.rewind()
 			bi++
 			adds++
