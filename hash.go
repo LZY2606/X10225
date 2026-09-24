@@ -8,10 +8,24 @@ import (
 )
 
 type hasher struct {
-	mh maphash.Hash
+	mh   maphash.Hash
+	hook digestHook
 }
 
+// digestHook is an internal test seam that allows forcing
+// the digest of a value, in order to guard against
+// incorrect behavior when distinct values collide.
+// Production callers never set it, and a digest returned
+// by the hook is still treated as a fast negative filter:
+// equal digests always trigger a deep-equality check.
+type digestHook func(interface{}) (uint64, bool)
+
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
+	if h.hook != nil {
+		if d, ok := h.hook(val); ok {
+			return d
+		}
+	}
 	h.mh.Reset()
 	h.hash(val, sort)
 
@@ -59,8 +73,8 @@ func (h *hasher) hash(i interface{}, sort bool) {
 }
 
 func (h *hasher) sortArray(a []interface{}) {
-	h1 := hasher{}
-	h2 := hasher{}
+	h1 := hasher{hook: h.hook}
+	h2 := hasher{hook: h.hook}
 
 	h1.mh.SetSeed(h.mh.Seed())
 	h2.mh.SetSeed(h.mh.Seed())
