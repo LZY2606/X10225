@@ -9,6 +9,13 @@ import (
 
 type hasher struct {
 	mh maphash.Hash
+
+	// override, when non-nil, replaces the digest
+	// implementation used by the array matching pipeline. It is
+	// an internal test seam that lets collision scenarios be
+	// exercised deterministically; equality verdicts remain the
+	// responsibility of deepEqual.
+	override func(interface{}) uint64
 }
 
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
