@@ -9,7 +9,7 @@ import (
 // A Differ generates JSON Patch (RFC 6902).
 // The zero value is an empty generator ready to use.
 type Differ struct {
-	hashmap          map[uint64]jsonNode
+	hashmap          map[uint64][]jsonNode
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
@@ -18,6 +18,8 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	stats            Stats
+	digestFunc       func(interface{}, bool) uint64
 }
 
 type (
@@ -47,6 +49,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats = Stats{}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -73,6 +76,7 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats = Stats{}
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,14 +163,19 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
-			d.hashmap = make(map[uint64]jsonNode)
+			d.hashmap = make(map[uint64][]jsonNode)
 		}
-		d.hashmap[k] = jsonNode{
+		// Nodes that share the same digest are chained so
+		// that duplicate values and hash collisions can be
+		// disambiguated with a deep-equality confirmation
+		// during copy candidate discovery.
+		d.hashmap[k] = append(d.hashmap[k], jsonNode{
 			ptr: ptr.copy(),
 			val: tgt,
-		}
+		})
+		d.stats.HashComputations++
 		return
 	}
 	// At this point, the source and target values
@@ -185,7 +194,18 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		oobj := vsrc
 		nobj := tgt.(map[string]interface{})
 
-		for k, v1 := range oobj {
+		// Iterate the keys in lexicographical order, like
+		// compareObjects does, so that the order in which
+		// candidate locations are indexed is deterministic
+		// and the generated patch is stable.
+		keys := make([]string, 0, len(oobj))
+		for k := range oobj {
+			keys = append(keys, k)
+		}
+		sortStrings(keys)
+
+		for _, k := range keys {
+			v1 := oobj[k]
 			if v2, ok := nobj[k]; ok {
 				p := ptr.clone()
 				p.appendKey(k)
@@ -335,7 +355,8 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	m := newArrayMatcher(src, tgt, d.digest, &d.stats)
+	pairs := m.lcs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -444,12 +465,14 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	count := 0
 
 	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
+		d.stats.HashComputations++
 		diff[k] = struct{}{}
 		count++
 	}
 	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
+		k := d.digest(v, d.opts.equivalent)
+		d.stats.HashComputations++
 		// If the digest hash is not in the comparison set,
 		// return early.
 		if _, ok := diff[k]; !ok {
@@ -510,10 +533,18 @@ func (d *Differ) remove(path string, v interface{}) {
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
-		if ok {
-			return node.ptr
+		k := d.digest(v, false)
+		d.stats.HashComputations++
+		chain := d.hashmap[k]
+		// Scan the chain starting from the most recently
+		// prepared node, and confirm the candidate with a
+		// deep-equality check so that duplicate values and
+		// hash collisions are never mis-paired.
+		for i := len(chain) - 1; i >= 0; i-- {
+			d.stats.MoveCopyCandidates++
+			if deepEqual(chain[i].val, v) {
+				return chain[i].ptr
+			}
 		}
 	}
 	return emptyPointer
@@ -522,8 +553,11 @@ func (d *Differ) findUnchanged(v interface{}) string {
 func (d *Differ) findRemoved(v interface{}) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+		if op.Type == OperationRemove {
+			d.stats.MoveCopyCandidates++
+			if deepEqual(op.OldValue, v) {
+				return i
+			}
 		}
 	}
 	return -1

@@ -41,7 +41,7 @@ func TestDiffer_Reset(t *testing.T) {
 			buf: make([]byte, 15),
 			sep: 15,
 		},
-		hashmap: map[uint64]jsonNode{
+		hashmap: map[uint64][]jsonNode{
 			1: {},
 		},
 		patch: make([]Operation, 42),
