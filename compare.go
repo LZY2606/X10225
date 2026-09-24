@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -34,13 +35,26 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
-			e := r.(invalidJSONTypeError)
+			switch e := r.(type) {
+			case error:
+				if errors.Is(e, ErrArrayMatchAmbiguous) {
+					err = e
+					patch = nil
+					return
+				}
+			}
+			e, ok := r.(invalidJSONTypeError)
+			if !ok {
+				panic(r)
+			}
 			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
 			patch = nil
 		}
 	}()
 	d.applyOpts(opts...)
-	d.Compare(source, target)
+	if err = d.Compare(source, target); err != nil {
+		return nil, err
+	}
 	patch = d.patch
 
 	return patch, err
@@ -63,7 +77,9 @@ func compare(d *Differ, src, tgt interface{}) (Patch, error) {
 	}
 	d.targetBytes = tb
 
-	d.Compare(si, ti)
+	if err = d.Compare(si, ti); err != nil {
+		return nil, err
+	}
 	return d.patch, nil
 }
 
@@ -80,7 +96,9 @@ func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, er
 	}
 	d.targetBytes = tgt
 
-	d.Compare(si, ti)
+	if err := d.Compare(si, ti); err != nil {
+		return nil, err
+	}
 	return d.patch, nil
 }
 

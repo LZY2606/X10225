@@ -1,6 +1,7 @@
 package jsondiff
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"unsafe"
@@ -9,7 +10,7 @@ import (
 // A Differ generates JSON Patch (RFC 6902).
 // The zero value is an empty generator ready to use.
 type Differ struct {
-	hashmap          map[uint64]jsonNode
+	hashmap          map[uint64][]jsonNode
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
@@ -18,6 +19,19 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+	curMatcher       *arrayMatcher
+	stats            matchStats
+	// arrayHash, when non-nil, replaces the production digest
+	// function used while comparing arrays. It is unexported and
+	// intended for diagnostics/testing (e.g. digest collisions);
+	// the production path uses hasher.digest directly.
+	arrayHash func(val interface{}, sort bool) uint64
+	// probeFault, when non-nil, is consulted before every
+	// structural comparison performed by an array matcher. A
+	// true result causes the comparison to fail with
+	// ErrArrayMatchAmbiguous instead of guessing an answer. It is
+	// unexported and intended for diagnostics/testing.
+	probeFault func() bool
 }
 
 type (
@@ -52,6 +66,8 @@ func (d *Differ) Reset() {
 	for k := range d.hashmap {
 		delete(d.hashmap, k)
 	}
+	d.curMatcher = nil
+	d.stats = matchStats{}
 }
 
 // WithOpts applies the given options to the Differ
@@ -72,7 +88,38 @@ func (d *Differ) Patch() Patch {
 
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
-func (d *Differ) Compare(src, tgt interface{}) {
+//
+// Compare normally never fails and never returns an error. When
+// the comparison is explicitly aborted (via an injected matcher
+// fault), it panics with ErrArrayMatchAmbiguous after rolling back
+// every partial state produced by the call: the patch, pointer,
+// factorized-value cache and diagnostic counters are restored to
+// their state on entry, so the Differ can be safely reused and
+// the exact same input retried.
+func (d *Differ) Compare(src, tgt interface{}) (err error) {
+	savedPatch := d.patch
+	savedPtr := d.ptr
+	savedSnapshotLen := d.snapshotPatchLen
+	savedHashMap := d.snapshotHashmap()
+	savedStats := d.stats
+
+	defer func() {
+		if r := recover(); r != nil {
+			if rAmb, ok := r.(error); ok && errors.Is(rAmb, ErrArrayMatchAmbiguous) {
+				d.patch = savedPatch
+				d.ptr = savedPtr
+				d.snapshotPatchLen = savedSnapshotLen
+				d.restoreHashmap(savedHashMap)
+				d.stats = savedStats
+				d.curMatcher = nil
+				err = rAmb
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	d.stats = matchStats{}
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +134,41 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+	return nil
+}
+
+func (d *Differ) snapshotHashmap() map[uint64][]jsonNode {
+	if d.hashmap == nil {
+		return nil
+	}
+	snap := make(map[uint64][]jsonNode, len(d.hashmap))
+	for k, v := range d.hashmap {
+		snap[k] = v
+	}
+	return snap
+}
+
+func (d *Differ) restoreHashmap(snap map[uint64][]jsonNode) {
+	if snap == nil {
+		d.hashmap = nil
+		return
+	}
+	for k := range d.hashmap {
+		delete(d.hashmap, k)
+	}
+	for k, v := range snap {
+		d.hashmap[k] = v
+	}
+}
+
+// digest computes the hash digest of a JSON value while
+// comparing arrays. It uses the production hasher unless an
+// unexported diagnostic override has been configured.
+func (d *Differ) digest(val interface{}, sort bool) uint64 {
+	if d.arrayHash != nil {
+		return d.arrayHash(val, sort)
+	}
+	return d.hasher.digest(val, sort)
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -159,14 +241,16 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
-			d.hashmap = make(map[uint64]jsonNode)
+			d.hashmap = make(map[uint64][]jsonNode)
 		}
-		d.hashmap[k] = jsonNode{
+		// Colliding digests are kept in a bucket; findUnchanged
+		// confirms equality structurally before returning a node.
+		d.hashmap[k] = append(d.hashmap[k], jsonNode{
 			ptr: ptr.copy(),
 			val: tgt,
-		}
+		})
 		return
 	}
 	// At this point, the source and target values
@@ -185,12 +269,17 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 		oobj := vsrc
 		nobj := tgt.(map[string]interface{})
 
+		keys := make([]string, 0, len(oobj))
 		for k, v1 := range oobj {
 			if v2, ok := nobj[k]; ok {
-				p := ptr.clone()
-				p.appendKey(k)
-				d.prepare(p, v1, v2)
+				keys = append(keys, k)
 			}
+		}
+		sortStrings(keys)
+		for _, k := range keys {
+			p := ptr.clone()
+			p.appendKey(k)
+			d.prepare(p, oobj[k], nobj[k])
 		}
 	default:
 		// Skipped.
@@ -329,13 +418,22 @@ comparisons:
 }
 
 func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc string) {
+	// One matcher per compared array. It is the single owner of
+	// equality verdicts, element digests and the LCS for this
+	// pair, and is consulted by add/remove factorization to
+	// discover move candidates without recomputing a comparison.
+	m := newArrayMatcher(d, src, tgt, false)
+	prevMatcher := d.curMatcher
+	d.curMatcher = m
+	defer func() { d.curMatcher = prevMatcher }()
+
 	if len(src) == len(tgt) {
 		if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
 			return
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := m.lcs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -440,24 +538,12 @@ func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
 	if len(src) != len(tgt) {
 		return false
 	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	// Use the same matcher abstraction as the ordered path: a
+	// digest pre-filter followed by a one-to-one structural
+	// matching, which is correct for duplicate elements and
+	// immune to digest collisions.
+	m := newArrayMatcher(d, src, tgt, true)
+	return m.multisetEqual()
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -510,19 +596,44 @@ func (d *Differ) remove(path string, v interface{}) {
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
+		k := d.digest(v, false)
+		bucket, ok := d.hashmap[k]
 		if ok {
-			return node.ptr
+			d.stats.CopyCandidates++
+			// Never trust the digest alone: every candidate is
+			// confirmed structurally so a collision cannot copy
+			// a different value. Buckets preserve insertion order,
+			// keeping the result stable for duplicate values.
+			for i := len(bucket) - 1; i >= 0; i-- {
+				node := bucket[i]
+				if deepEqual(node.val, v) {
+					return node.ptr
+				}
+			}
 		}
 	}
 	return emptyPointer
 }
 
-func (d *Differ) findRemoved(v interface{}) int {
+func (d *Differ) findRemoved(v interface{}) (idx int) {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		if op.Type != OperationRemove {
+			continue
+		}
+		d.stats.MoveCandidates++
+		// When both values belong to the array currently being
+		// matched, reuse its memoized verdict so each candidate
+		// pair is compared at most once; otherwise fall back to
+		// a structural comparison (cross-array/object moves).
+		eq, ok := false, false
+		if d.curMatcher != nil {
+			eq, ok = d.curMatcher.verdictForValues(op.OldValue, v)
+		}
+		if !ok {
+			eq = deepEqual(op.OldValue, v)
+		}
+		if eq {
 			return i
 		}
 	}
