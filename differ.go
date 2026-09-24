@@ -12,6 +12,7 @@ type Differ struct {
 	hashmap          map[uint64]jsonNode
 	opts             options
 	patch            Patch
+	stats            *Stats
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
@@ -47,6 +48,9 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	if d.stats != nil {
+		*d.stats = Stats{}
+	}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -159,7 +163,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.digest(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -335,7 +339,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := newArrayMatcher(src, tgt, d.digestFunc(false), d.stats).lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -437,27 +441,32 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 }
 
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
+	return unorderedMatch(src, tgt, d.digestFunc(d.opts.equivalent), d.stats)
+}
 
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+// digest returns the digest of the given value and accounts
+// it in the diagnostic stats, if any are collected.
+func (d *Differ) digest(v interface{}, sort bool) uint64 {
+	if d.stats != nil {
+		d.stats.Digests++
 	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
+	return d.hasher.digest(v, sort)
+}
+
+// digestFunc returns a digest function that accounts each
+// digest in the diagnostic stats, if any are collected.
+func (d *Differ) digestFunc(sort bool) digestFunc {
+	return func(v interface{}) uint64 {
+		return d.digest(v, sort)
 	}
-	return count == 0
+}
+
+// countComparison accounts a deep-equality check in the
+// diagnostic stats, if any are collected.
+func (d *Differ) countComparison() {
+	if d.stats != nil {
+		d.stats.Comparisons++
+	}
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -510,10 +519,16 @@ func (d *Differ) remove(path string, v interface{}) {
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		k := d.digest(v, false)
 		node, ok := d.hashmap[k]
 		if ok {
-			return node.ptr
+			// Confirm the digest match with a deep-equality
+			// check, so that a hash collision cannot pair
+			// the value with a distinct unchanged value.
+			d.countComparison()
+			if deepEqual(node.val, v) {
+				return node.ptr
+			}
 		}
 	}
 	return emptyPointer
@@ -522,8 +537,11 @@ func (d *Differ) findUnchanged(v interface{}) string {
 func (d *Differ) findRemoved(v interface{}) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+		if op.Type == OperationRemove {
+			d.countComparison()
+			if deepEqual(op.OldValue, v) {
+				return i
+			}
 		}
 	}
 	return -1

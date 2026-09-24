@@ -30,6 +30,11 @@ func (h *hasher) hash(i interface{}, sort bool) {
 		}
 	case float64:
 		var buf [8]byte
+		// Normalize negative zero so that the digest stays
+		// consistent with deep-equality, for which -0 == +0.
+		if v == 0 {
+			v = 0
+		}
 		binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
 		_, _ = h.mh.Write(buf[:])
 	case nil:

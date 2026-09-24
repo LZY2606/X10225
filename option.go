@@ -89,3 +89,14 @@ func Ignores(ptrs ...string) Option {
 		o.opts.hasIgnore = true
 	}
 }
+
+// CollectStats makes the Differ record diagnostic counters
+// into the given Stats value. The counters are informational
+// only and never influence the generated patch. They are
+// reset by Differ.Reset, and are isolated per Differ instance;
+// concurrent comparisons must collect into distinct Stats.
+func CollectStats(s *Stats) Option {
+	return func(o *Differ) {
+		o.stats = s
+	}
+}
