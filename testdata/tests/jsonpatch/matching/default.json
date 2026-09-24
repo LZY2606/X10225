@@ -1,0 +1,333 @@
+[
+  {
+    "name": "duplicate values reorder",
+    "before": [
+      "a",
+      "b",
+      "a",
+      "c",
+      "a"
+    ],
+    "after": [
+      "a",
+      "a",
+      "c",
+      "a",
+      "b"
+    ],
+    "patch": [
+      {
+        "value": "a",
+        "op": "replace",
+        "path": "/1"
+      },
+      {
+        "value": "c",
+        "op": "replace",
+        "path": "/2"
+      },
+      {
+        "value": "a",
+        "op": "replace",
+        "path": "/3"
+      },
+      {
+        "value": "b",
+        "op": "replace",
+        "path": "/4"
+      }
+    ]
+  },
+  {
+    "name": "duplicate values cross",
+    "before": [
+      "x",
+      "x",
+      "y"
+    ],
+    "after": [
+      "y",
+      "x",
+      "x"
+    ],
+    "patch": [
+      {
+        "value": "y",
+        "op": "replace",
+        "path": "/0"
+      },
+      {
+        "value": "x",
+        "op": "replace",
+        "path": "/2"
+      }
+    ]
+  },
+  {
+    "name": "deep object nested array",
+    "before": {
+      "a": {
+        "b": {
+          "c": {
+            "d": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "e": "x"
+          }
+        }
+      }
+    },
+    "after": {
+      "a": {
+        "b": {
+          "c": {
+            "d": [
+              2,
+              3,
+              4,
+              5
+            ],
+            "e": "x"
+          }
+        }
+      }
+    },
+    "patch": [
+      {
+        "value": 2,
+        "op": "replace",
+        "path": "/a/b/c/d/0"
+      },
+      {
+        "value": 3,
+        "op": "replace",
+        "path": "/a/b/c/d/1"
+      },
+      {
+        "value": 4,
+        "op": "replace",
+        "path": "/a/b/c/d/2"
+      },
+      {
+        "value": 5,
+        "op": "replace",
+        "path": "/a/b/c/d/3"
+      }
+    ]
+  },
+  {
+    "name": "head insertion",
+    "before": [
+      2,
+      3,
+      4,
+      5
+    ],
+    "after": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "patch": [
+      {
+        "value": 1,
+        "op": "replace",
+        "path": "/0"
+      },
+      {
+        "value": 2,
+        "op": "replace",
+        "path": "/1"
+      },
+      {
+        "value": 3,
+        "op": "replace",
+        "path": "/2"
+      },
+      {
+        "value": 4,
+        "op": "replace",
+        "path": "/3"
+      },
+      {
+        "value": 5,
+        "op": "add",
+        "path": "/-"
+      }
+    ]
+  },
+  {
+    "name": "tail insertion",
+    "before": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "after": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "patch": [
+      {
+        "value": 5,
+        "op": "add",
+        "path": "/-"
+      }
+    ]
+  },
+  {
+    "name": "head and tail insertion",
+    "before": [
+      2,
+      3,
+      4
+    ],
+    "after": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "patch": [
+      {
+        "value": 1,
+        "op": "replace",
+        "path": "/0"
+      },
+      {
+        "value": 2,
+        "op": "replace",
+        "path": "/1"
+      },
+      {
+        "value": 3,
+        "op": "replace",
+        "path": "/2"
+      },
+      {
+        "value": 4,
+        "op": "add",
+        "path": "/-"
+      },
+      {
+        "value": 5,
+        "op": "add",
+        "path": "/-"
+      }
+    ]
+  },
+  {
+    "name": "cross move halves",
+    "before": [
+      {
+        "id": 1
+      },
+      {
+        "id": 2
+      },
+      {
+        "id": 3
+      },
+      {
+        "id": 4
+      }
+    ],
+    "after": [
+      {
+        "id": 3
+      },
+      {
+        "id": 4
+      },
+      {
+        "id": 1
+      },
+      {
+        "id": 2
+      }
+    ],
+    "patch": [
+      {
+        "value": 3,
+        "op": "replace",
+        "path": "/0/id"
+      },
+      {
+        "value": 4,
+        "op": "replace",
+        "path": "/1/id"
+      },
+      {
+        "value": 1,
+        "op": "replace",
+        "path": "/2/id"
+      },
+      {
+        "value": 2,
+        "op": "replace",
+        "path": "/3/id"
+      }
+    ]
+  },
+  {
+    "name": "cross move interleaved",
+    "before": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "after": [
+      4,
+      5,
+      6,
+      1,
+      2,
+      3
+    ],
+    "patch": [
+      {
+        "value": 4,
+        "op": "replace",
+        "path": "/0"
+      },
+      {
+        "value": 5,
+        "op": "replace",
+        "path": "/1"
+      },
+      {
+        "value": 6,
+        "op": "replace",
+        "path": "/2"
+      },
+      {
+        "value": 1,
+        "op": "replace",
+        "path": "/3"
+      },
+      {
+        "value": 2,
+        "op": "replace",
+        "path": "/4"
+      },
+      {
+        "value": 3,
+        "op": "replace",
+        "path": "/5"
+      }
+    ]
+  }
+]

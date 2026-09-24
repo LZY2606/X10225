@@ -16,6 +16,7 @@ type Differ struct {
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	stats            Stats
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -24,6 +25,17 @@ type (
 	marshalFunc   func(any) ([]byte, error)
 	unmarshalFunc func([]byte, any) error
 )
+
+// differState is a snapshot of the mutable state of a Differ,
+// captured before a comparison and restored if the comparison
+// fails, so that a failed comparison never leaves the Differ
+// in a half-updated state.
+type differState struct {
+	hashmap          map[uint64]jsonNode
+	stats            Stats
+	patchLen         int
+	snapshotPatchLen int
+}
 
 type options struct {
 	ignores     map[string]struct{}
@@ -47,6 +59,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats = Stats{}
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -70,9 +83,31 @@ func (d *Differ) Patch() Patch {
 	return d.patch
 }
 
+// Stats returns a copy of the diagnostic counters collected
+// during the last comparison performed by the Differ instance.
+// The counters are reset at the beginning of each comparison
+// and are valid for usage until the next comparison or reset.
+func (d *Differ) Stats() Stats {
+	return d.stats
+}
+
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats = Stats{}
+	state := d.snapshot()
+
+	// If the comparison panics, e.g. because a value of an
+	// invalid JSON type is encountered, restore the state of
+	// the Differ captured before the comparison, so that the
+	// instance is not left half-updated and can be reused to
+	// retry the comparison.
+	defer func() {
+		if r := recover(); r != nil {
+			d.rollback(state)
+			panic(r)
+		}
+	}()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +122,43 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+}
+
+// snapshot captures the mutable state of the Differ that a
+// comparison may alter.
+func (d *Differ) snapshot() differState {
+	s := differState{
+		stats:            d.stats,
+		patchLen:         len(d.patch),
+		snapshotPatchLen: d.snapshotPatchLen,
+	}
+	// The hashmap is only populated when the Factorize
+	// option is enabled.
+	if d.opts.factorize && d.hashmap != nil {
+		s.hashmap = make(map[uint64]jsonNode, len(d.hashmap))
+		for k, v := range d.hashmap {
+			s.hashmap[k] = v
+		}
+	}
+	return s
+}
+
+// rollback restores the state of the Differ captured by a
+// previous call to snapshot.
+func (d *Differ) rollback(s differState) {
+	d.patch = d.patch[:s.patchLen]
+	d.snapshotPatchLen = s.snapshotPatchLen
+	d.stats = s.stats
+	d.ptr.reset()
+
+	if d.opts.factorize && d.hashmap != nil {
+		for k := range d.hashmap {
+			delete(d.hashmap, k)
+		}
+		for k, v := range s.hashmap {
+			d.hashmap[k] = v
+		}
+	}
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -335,7 +407,8 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	m := newMatcher(src, tgt, &d.stats)
+	pairs := m.lcsPairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -522,8 +595,11 @@ func (d *Differ) findUnchanged(v interface{}) string {
 func (d *Differ) findRemoved(v interface{}) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+		if op.Type == OperationRemove {
+			d.stats.MoveCopyChecks++
+			if deepEqual(op.OldValue, v) {
+				return i
+			}
 		}
 	}
 	return -1

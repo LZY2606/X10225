@@ -2,13 +2,15 @@ package jsondiff
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"hash/maphash"
 	"math"
 	"slices"
 )
 
 type hasher struct {
-	mh maphash.Hash
+	mh     maphash.Hash
+	strict bool
 }
 
 func (h *hasher) digest(val interface{}, sort bool) uint64 {
@@ -30,10 +32,21 @@ func (h *hasher) hash(i interface{}, sort bool) {
 		}
 	case float64:
 		var buf [8]byte
+		if v == 0 {
+			// Normalize negative zero so that the digest
+			// is consistent with deep-equality, for
+			// which -0 == 0.
+			v = 0
+		}
 		binary.BigEndian.PutUint64(buf[:], math.Float64bits(v))
 		_, _ = h.mh.Write(buf[:])
 	case nil:
 		_ = h.mh.WriteByte('0')
+	case json.Number:
+		// Numbers of this type are not hashed; they all
+		// share the same digest, and the equality of the
+		// candidate pairs they form is systematically
+		// verified with a deep-equality check.
 	case []interface{}:
 		if sort {
 			h.sortArray(v)
@@ -54,6 +67,13 @@ func (h *hasher) hash(i interface{}, sort bool) {
 		for _, k := range keys {
 			_, _ = h.mh.WriteString(k)
 			h.hash(v[k], sort)
+		}
+	default:
+		if h.strict {
+			// Reject values that are not valid JSON
+			// types explicitly, rather than silently
+			// hashing them to a meaningless digest.
+			panic(invalidJSONTypeError{t: i})
 		}
 	}
 }
