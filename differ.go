@@ -16,6 +16,7 @@ type Differ struct {
 	targetBytes      []byte
 	ptr              pointer
 	hasher           hasher
+	stats            diffStats
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -47,6 +48,7 @@ type jsonNode struct {
 func (d *Differ) Reset() {
 	d.patch = d.patch[:0]
 	d.ptr.reset()
+	d.stats.reset()
 
 	// Optimized map clear.
 	for k := range d.hashmap {
@@ -70,9 +72,24 @@ func (d *Differ) Patch() Patch {
 	return d.patch
 }
 
+// Comparisons returns the number of deep-equality comparisons
+// performed during the last comparison, while matching the
+// elements of arrays (LCS) and discovering move/copy
+// candidates.
+//
+// The counter is reset at the beginning of each call to
+// Compare, is strictly diagnostic, and has no effect on the
+// generated patch. Each Differ instance owns its counter, so
+// concurrent comparisons performed by distinct instances are
+// isolated from each other.
+func (d *Differ) Comparisons() int {
+	return d.stats.comparisons
+}
+
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	d.stats.reset()
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -335,7 +352,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := newArrayMatcher(src, tgt, &d.hasher, &d.stats).pairs()
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -522,8 +539,11 @@ func (d *Differ) findUnchanged(v interface{}) string {
 func (d *Differ) findRemoved(v interface{}) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+		if op.Type == OperationRemove {
+			d.stats.comparisons++
+			if deepEqual(op.OldValue, v) {
+				return i
+			}
 		}
 	}
 	return -1
