@@ -2,6 +2,7 @@ package jsondiff
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -34,6 +35,10 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 
 	defer func() {
 		if r := recover(); r != nil {
+			if e, ok := r.(error); ok && errors.Is(e, errComparisonInterrupted) {
+				patch, err = nil, fmt.Errorf("%w", errComparisonInterrupted)
+				return
+			}
 			e := r.(invalidJSONTypeError)
 			err = fmt.Errorf("jsondiff: invalid json type: %T", e.t)
 			patch = nil
@@ -46,7 +51,16 @@ func CompareWithoutMarshal(source, target interface{}, opts ...Option) (patch Pa
 	return patch, err
 }
 
-func compare(d *Differ, src, tgt interface{}) (Patch, error) {
+func compare(d *Differ, src, tgt interface{}) (patch Patch, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if errors.Is(unwrapSentinel(r), errComparisonInterrupted) {
+				patch, err = nil, fmt.Errorf("%w", errComparisonInterrupted)
+				return
+			}
+			panic(r)
+		}
+	}()
 	if d.opts.marshal == nil {
 		d.opts.marshal = json.Marshal
 	}
@@ -67,7 +81,23 @@ func compare(d *Differ, src, tgt interface{}) (Patch, error) {
 	return d.patch, nil
 }
 
-func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (Patch, error) {
+func unwrapSentinel(r interface{}) error {
+	if e, ok := r.(error); ok {
+		return e
+	}
+	return nil
+}
+
+func compareJSON(d *Differ, src, tgt []byte, unmarshal unmarshalFunc) (patch Patch, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok && errors.Is(e, errComparisonInterrupted) {
+				patch, err = nil, fmt.Errorf("%w", errComparisonInterrupted)
+				return
+			}
+			panic(r)
+		}
+	}()
 	if unmarshal == nil {
 		unmarshal = json.Unmarshal
 	}

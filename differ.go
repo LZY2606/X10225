@@ -15,7 +15,7 @@ type Differ struct {
 	snapshotPatchLen int
 	targetBytes      []byte
 	ptr              pointer
-	hasher           hasher
+	match            *matcher
 	isCompact        bool
 	compactInPlace   bool
 }
@@ -35,6 +35,11 @@ type options struct {
 	invertible  bool
 	equivalent  bool
 	lcs         bool
+
+	// Test-only diagnostics and fault injection points.
+	// They are not reachable from exported Options.
+	diagnostics *matchCounters
+	testHooks   matchHooks
 }
 
 type jsonNode struct {
@@ -73,6 +78,11 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Every comparison gets an isolated matcher: equality
+	// memo, hashes and diagnostic counters never leak into
+	// another comparison, including concurrent ones.
+	d.match = newMatcher(d.opts.testHooks)
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -87,6 +97,14 @@ func (d *Differ) Compare(src, tgt interface{}) {
 		}
 	}
 	d.diff(d.ptr, src, tgt, b2s(d.targetBytes))
+
+	// Publish diagnostic counters only on success, then
+	// release the matcher so no cache, counter or temporary
+	// state survives the comparison.
+	if d.opts.diagnostics != nil {
+		*d.opts.diagnostics = d.match.counters()
+	}
+	d.match = nil
 }
 
 func (d *Differ) isIgnored(ptr pointer) bool {
@@ -159,7 +177,7 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.matcherOrNil().digestOf(tgt, false)
 		if d.hashmap == nil {
 			d.hashmap = make(map[uint64]jsonNode)
 		}
@@ -335,7 +353,7 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	pairs := d.matcherOrNil().lcs(src, tgt)
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -437,27 +455,18 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 }
 
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
+	m := d.matcherOrNil()
+	return m.unorderedEqual(src, tgt, d.opts.equivalent)
+}
 
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
+// matcherOrNil returns the matcher of the ongoing
+// comparison, or a throwaway one when the method is invoked
+// directly on a zero-value Differ (internal tests only).
+func (d *Differ) matcherOrNil() *matcher {
+	if d.match == nil {
+		d.match = newMatcher(matchHooks{})
 	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	return d.match
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -510,9 +519,14 @@ func (d *Differ) remove(path string, v interface{}) {
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
+		m := d.matcherOrNil()
+		m.stats.copyCandidates++
+		k := m.digestOf(v, false)
 		node, ok := d.hashmap[k]
-		if ok {
+		// The hash is only a lookup key: confirm equality
+		// explicitly so that a hash collision cannot pair a
+		// value with an unrelated unchanged node.
+		if ok && m.equal(node.val, v) {
 			return node.ptr
 		}
 	}
@@ -520,10 +534,14 @@ func (d *Differ) findUnchanged(v interface{}) string {
 }
 
 func (d *Differ) findRemoved(v interface{}) int {
+	m := d.matcherOrNil()
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
-			return i
+		if op.Type == OperationRemove {
+			m.stats.moveCandidates++
+			if m.equal(op.OldValue, v) {
+				return i
+			}
 		}
 	}
 	return -1
