@@ -18,6 +18,15 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+
+	// matcher is the per-Compare owner of equality, digest,
+	// LCS and move/copy candidate accounting. It is replaced
+	// at the start of every Compare call, so concurrent
+	// comparisons never share diagnostic state.
+	matcher *valueInterner
+
+	// matchHooks is a test-only seam; nil on production paths.
+	matchHooks *matchHooks
 }
 
 type (
