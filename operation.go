@@ -35,6 +35,10 @@ type Operation struct {
 	From     string      `json:"from,omitempty"`
 	Path     string      `json:"path"`
 	valueLen int
+	// oldDigest caches the hash digest of OldValue for remove
+	// operations when factorization is enabled, so that move
+	// candidates are matched against a digest computed once.
+	oldDigest uint64
 }
 
 // MarshalJSON implements the json.Marshaler interface.
