@@ -1,15 +1,24 @@
 package jsondiff
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"unsafe"
 )
 
+// errComparisonAborted is the sentinel used by the internal,
+// test-only failure injection hook. It belongs to the
+// package's error layer: it is an ordinary error value that
+// callers can identify with errors.Is, and recovery from a
+// comparison that aborted with it never leaves behind a
+// partially emitted patch.
+var errComparisonAborted = errors.New("jsondiff: comparison aborted by internal failure hook")
+
 // A Differ generates JSON Patch (RFC 6902).
 // The zero value is an empty generator ready to use.
 type Differ struct {
-	hashmap          map[uint64]jsonNode
+	hashmap          map[uint64][]jsonNode
 	opts             options
 	patch            Patch
 	snapshotPatchLen int
@@ -18,6 +27,23 @@ type Differ struct {
 	hasher           hasher
 	isCompact        bool
 	compactInPlace   bool
+
+	// diag holds diagnostic counters for the most recent
+	// comparison. It is reset at the beginning of every
+	// comparison and is never consulted to build a patch.
+	diag matchStats
+	// oracle is the comparison-wide equality service. It is
+	// (re)created for every comparison and therefore never
+	// shared between concurrent comparisons.
+	oracle *eqOracle
+
+	// testDigest and testFailHook are unexported, internal
+	// test seams. Both are nil in production code and never
+	// alter the public API. They drive the *same* production
+	// algorithm; no separate code path is maintained for
+	// tests.
+	testDigest  func(interface{}) uint64
+	testFailHook func(stage string) bool
 }
 
 type (
@@ -73,6 +99,28 @@ func (d *Differ) Patch() Patch {
 // Compare computes the differences between src and tgt
 // as a series of JSON Patch operations.
 func (d *Differ) Compare(src, tgt interface{}) {
+	// Each comparison starts from clean diagnostic state and
+	// owns a fresh equality oracle, so counters and caches
+	// are isolated between comparisons (including concurrent
+	// ones using distinct Differ instances).
+	d.diag = matchStats{}
+	d.oracle = newEqOracle(d)
+
+	// On any failure (including the internal failure hook),
+	// restore the public state to what it was before the
+	// comparison: a failed comparison must never expose a
+	// partially generated patch, nor leak temp state into a
+	// later successful comparison.
+	startLen := len(d.patch)
+	defer func() {
+		if r := recover(); r != nil {
+			d.patch = d.patch[:startLen]
+			d.ptr.reset()
+			defer panic(r)
+		}
+		d.oracle = nil
+	}()
+
 	if d.opts.factorize {
 		d.prepare(d.ptr, src, tgt)
 		d.ptr.reset()
@@ -159,14 +207,14 @@ func (d *Differ) prepare(ptr pointer, src, tgt interface{}) {
 	if !areComparable(src, tgt) {
 		return
 	} else if deepEqual(src, tgt) {
-		k := d.hasher.digest(tgt, false)
+		k := d.oracle.digestOf(tgt, false)
 		if d.hashmap == nil {
-			d.hashmap = make(map[uint64]jsonNode)
+			d.hashmap = make(map[uint64][]jsonNode)
 		}
-		d.hashmap[k] = jsonNode{
+		d.hashmap[k] = append(d.hashmap[k], jsonNode{
 			ptr: ptr.copy(),
 			val: tgt,
-		}
+		})
 		return
 	}
 	// At this point, the source and target values
@@ -296,8 +344,11 @@ func (d *Differ) compareArrays(ptr pointer, src, tgt []interface{}, doc string) 
 		}
 		goto comparisons // skip equivalence test since arrays are different
 	}
-	if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
-		return
+	if d.opts.equivalent {
+		m := newArrayMatcher(d, d.oracle, src, tgt, true)
+		if m.unorderedEqual() {
+			return
+		}
 	}
 comparisons:
 	// Compare the elements at each index present in
@@ -330,12 +381,26 @@ comparisons:
 
 func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc string) {
 	if len(src) == len(tgt) {
-		if d.opts.equivalent && d.unorderedDeepEqualSlice(src, tgt) {
-			return
+		if d.opts.equivalent {
+			em := newArrayMatcher(d, d.oracle, src, tgt, true)
+			if em.unorderedEqual() {
+				return
+			}
 		}
 	}
 	ptr.snapshot()
-	pairs := lcs(src, tgt)
+	matcher := newArrayMatcher(d, d.oracle, src, tgt, false)
+	pairs := matcher.lcsPairs()
+
+	// Internal, recoverable failure hook injected mid-way
+	// through an array comparison: candidates have been
+	// computed but no array operation has been emitted yet.
+	// Aborting here lets callers verify that a recovered
+	// failure neither changes the public patch structure nor
+	// leaves counters/caches behind.
+	if d.testFailHook != nil && d.testFailHook("lcs-candidates") {
+		panic(errComparisonAborted)
+	}
 	d.snapshotPatchLen = len(d.patch)
 
 	var ai, bi int // src && tgt arrows
@@ -437,27 +502,8 @@ func (d *Differ) compareArraysLCS(ptr pointer, src, tgt []interface{}, doc strin
 }
 
 func (d *Differ) unorderedDeepEqualSlice(src, tgt []interface{}) bool {
-	if len(src) != len(tgt) {
-		return false
-	}
-	diff := make(map[uint64]struct{}, len(src))
-	count := 0
-
-	for _, v := range src {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		diff[k] = struct{}{}
-		count++
-	}
-	for _, v := range tgt {
-		k := d.hasher.digest(v, d.opts.equivalent)
-		// If the digest hash is not in the comparison set,
-		// return early.
-		if _, ok := diff[k]; !ok {
-			return false
-		}
-		count--
-	}
-	return count == 0
+	m := newArrayMatcher(d, d.oracle, src, tgt, d.opts.equivalent)
+	return m.unorderedEqual()
 }
 
 func (d *Differ) replace(path string, src, tgt interface{}, doc string) {
@@ -510,10 +556,14 @@ func (d *Differ) remove(path string, v interface{}) {
 
 func (d *Differ) findUnchanged(v interface{}) string {
 	if d.hashmap != nil {
-		k := d.hasher.digest(v, false)
-		node, ok := d.hashmap[k]
-		if ok {
-			return node.ptr
+		k := d.oracle.digestOf(v, false)
+		// The digest only selects a bucket: a hit must be
+		// confirmed with deep equality, otherwise a hash
+		// collision could copy the wrong source location.
+		for _, node := range d.hashmap[k] {
+			if d.oracle.equalValues(node.val, v, k) {
+				return node.ptr
+			}
 		}
 	}
 	return emptyPointer
@@ -522,7 +572,7 @@ func (d *Differ) findUnchanged(v interface{}) string {
 func (d *Differ) findRemoved(v interface{}) int {
 	for i := 0; i < len(d.patch); i++ {
 		op := d.patch[i]
-		if op.Type == OperationRemove && deepEqual(op.OldValue, v) {
+		if op.Type == OperationRemove && d.oracle.equalValues(op.OldValue, v, 0) {
 			return i
 		}
 	}
